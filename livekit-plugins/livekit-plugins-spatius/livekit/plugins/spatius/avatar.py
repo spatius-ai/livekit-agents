@@ -95,6 +95,7 @@ class AvatarSession(BaseAvatarSession):
         bitrate: int = 0,
         opus_frame_duration_ms: int = DEFAULT_OPUS_FRAME_DURATION_MS,
         opus_application: str = DEFAULT_OPUS_APPLICATION,
+        extra_params: dict[str, str] | None = None,
     ) -> None:
         super().__init__()
 
@@ -136,6 +137,7 @@ class AvatarSession(BaseAvatarSession):
         self._idle_timeout_seconds = idle_timeout_seconds
         self._sample_rate = int(sample_rate) if utils.is_given(sample_rate) else None
         self._bitrate = bitrate
+        self._extra_params = dict(extra_params or {})
         self._opus_encoder = (
             OggOpusEncoderConfig(
                 frame_duration_ms=opus_frame_duration_ms,
@@ -252,6 +254,7 @@ class AvatarSession(BaseAvatarSession):
                 bitrate=self._bitrate,
                 audio_format=self._audio_format,
                 ogg_opus_encoder=self._opus_encoder,
+                extra_params=self._extra_params,
                 on_error=self._on_spatius_error,
                 on_close=self._on_spatius_close,
             )

@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "livekit-agents>=1.6.8",
-    "spatius[opus]>=1.0.4",
+    "spatius[opus] @ git+https://github.com/spatius-ai/spatius-sdk-python.git@a208086",
 ]
 
 [project.urls]
@@ -33,6 +33,9 @@ Source = "https://github.com/livekit/agents"
 
 [tool.hatch.version]
 path = "livekit/plugins/spatius/version.py"
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["livekit"]
