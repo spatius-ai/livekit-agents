@@ -8,7 +8,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from spatius import AudioFormat, LiveKitTransportConfig, new_avatar_session
+from spatius import AudioFormat, AvatarDetail, LiveKitTransportConfig, new_avatar_session
 from spatius.proto.generated import message_pb2
 
 from livekit import api, rtc
@@ -34,10 +34,15 @@ def _session(**kwargs: Any) -> AvatarSession:
 
 
 @asynccontextmanager
-async def _started_avatar(**kwargs: Any) -> AsyncIterator[tuple[Any, ...]]:
+async def _started_avatar(
+    *, avatar_detail: AvatarDetail | None = None, **kwargs: Any
+) -> AsyncIterator[tuple[Any, ...]]:
     sdk_session = MagicMock()
     for method in ("init", "start", "close", "send_audio", "interrupt"):
         setattr(sdk_session, method, AsyncMock())
+    sdk_session.get_avatar_detail = AsyncMock(
+        return_value=avatar_detail or AvatarDetail(("neutral", "happy", "sad"), "neutral")
+    )
     room = MagicMock()
     room.name = "test-room"
     room.local_participant.identity = "test-agent"
@@ -111,6 +116,7 @@ async def test_start_serializes_v3_transport_with_token_auth() -> None:
         assert kwargs["ogg_opus_encoder"].application == "audio"
         assert kwargs["bitrate"] == 32_000
         sdk_session.init.assert_awaited_once()
+        sdk_session.get_avatar_detail.assert_awaited_once()
         sdk_session.start.assert_awaited_once()
         agent_session.output.replace_audio_tail.assert_called_once_with(session._audio)
         assert {
@@ -161,7 +167,7 @@ async def test_audio_frames_and_end_are_forwarded_as_one_request() -> None:
     async with _started_avatar() as (session, sdk_session, *_):
         end_sent = asyncio.Event()
 
-        async def send_audio(*, audio: bytes, end: bool) -> None:
+        async def send_audio(*, audio: bytes, end: bool, **options: Any) -> None:
             if end:
                 end_sent.set()
 
@@ -174,14 +180,16 @@ async def test_audio_frames_and_end_are_forwarded_as_one_request() -> None:
         await asyncio.wait_for(end_sent.wait(), timeout=1.0)
 
         assert sdk_session.send_audio.await_args_list == [
-            call(audio=bytes(frame.data), end=False),
+            call(audio=bytes(frame.data), end=False, emotion="neutral"),
             call(audio=bytes(frame.data), end=False),
             call(audio=b"", end=True),
         ]
 
 
 async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
-    async with _started_avatar() as (session, _, *_):
+    async with _started_avatar() as (session, sdk_session, *_):
+        sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **_: sent.set()
         assert session._audio is not None
         audio = session._audio
         started = MagicMock()
@@ -189,6 +197,7 @@ async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
         await audio.capture_frame(_frame())
         audio.flush()
 
+        await asyncio.wait_for(sent.wait(), timeout=1)
         started.assert_not_called()
         assert session._on_playback_started_rpc(_rpc("other-participant")) == "reject"
         assert session._on_playback_started_rpc(_rpc(session.avatar_identity)) == "ok"
@@ -215,14 +224,18 @@ async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
 @pytest.mark.parametrize("confirm_interrupt", [False, True])
 async def test_clear_buffer_interrupts_and_releases_playout(confirm_interrupt: bool) -> None:
     async with _started_avatar() as (session, sdk_session, *_):
+        sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **_: sent.set()
         assert session._audio is not None
         audio = session._audio
         await audio.capture_frame(_frame())
         audio.flush()
+        await asyncio.wait_for(sent.wait(), timeout=1)
+        interrupted = asyncio.Event()
+        sdk_session.interrupt.side_effect = lambda: interrupted.set()
         audio.clear_buffer()
         assert session._interrupt_atask is not None
-        await session._interrupt_atask
-        sdk_session.interrupt.assert_awaited_once()
+        await asyncio.wait_for(interrupted.wait(), timeout=1)
 
         if confirm_interrupt:
             assert (
@@ -234,6 +247,12 @@ async def test_clear_buffer_interrupts_and_releases_playout(confirm_interrupt: b
         else:
             session._cancel_clear_buffer_timeout()
             session._on_clear_buffer_timeout()
+        if confirm_interrupt:
+            await asyncio.wait_for(session._interrupt_atask, timeout=1.0)
+        else:
+            assert session._aclose_atask is not None
+            await asyncio.wait_for(session._aclose_atask, timeout=1.0)
+        sdk_session.interrupt.assert_awaited_once()
         result = await asyncio.wait_for(audio.wait_for_playout(), timeout=1.0)
         assert result.interrupted is True
         assert audio._pending_playback_count == 0
@@ -254,16 +273,21 @@ async def test_close_releases_pending_playout_and_closes_sdk_once() -> None:
         assert session._forward_atask is None
 
 
-async def test_start_failure_closes_sdk_and_does_not_attach_audio() -> None:
+@pytest.mark.parametrize("phase", ["init", "get_avatar_detail", "start"])
+async def test_start_failure_closes_sdk_and_does_not_attach_audio(phase: str) -> None:
     sdk_session = MagicMock()
     sdk_session.init = AsyncMock()
-    sdk_session.start = AsyncMock(side_effect=RuntimeError("handshake rejected"))
+    sdk_session.start = AsyncMock()
     sdk_session.close = AsyncMock()
+    sdk_session.get_avatar_detail = AsyncMock(
+        return_value=AvatarDetail(("neutral", "happy", "sad"), "neutral")
+    )
     room = MagicMock()
     room.name = "test-room"
     room.local_participant.identity = "test-agent"
     agent_session = MagicMock()
     session = _session()
+    getattr(sdk_session, phase).side_effect = RuntimeError("startup request failed")
 
     with (
         patch("livekit.plugins.spatius.avatar.BaseAvatarSession.start", new=AsyncMock()),
@@ -281,3 +305,119 @@ async def test_start_failure_closes_sdk_and_does_not_attach_audio() -> None:
     sdk_session.close.assert_awaited_once()
     agent_session.output.replace_audio_tail.assert_not_called()
     assert session._closed is True
+
+
+async def test_emotion_discovery_precedes_websocket_and_is_reused() -> None:
+    detail = AvatarDetail(("calm", "興奮"), "calm")
+    async with _started_avatar(avatar_detail=detail) as (avatar, sdk, _, room, agent_session):
+        assert [call[0] for call in sdk.mock_calls[:3]] == ["init", "get_avatar_detail", "start"]
+        assert avatar.available_emotions == ("calm", "興奮")
+        assert avatar.default_emotion == "calm"
+        assert "calm" in avatar.expression_instructions
+        assert "neutral" not in avatar.expression_instructions
+        assert avatar._expressions.default_expression.emotion == "calm"
+        for _ in range(2):
+            await avatar.start(agent_session, room)
+            assert avatar.available_emotions is detail.available_emotions
+        sdk.get_avatar_detail.assert_awaited_once()
+        sdk.start.assert_awaited_once()
+
+
+def test_emotion_metadata_requires_startup() -> None:
+    avatar = _session()
+    for name in ("available_emotions", "default_emotion", "expression_instructions"):
+        with pytest.raises(SpatiusException, match="start the avatar session"):
+            getattr(avatar, name)
+
+
+async def test_unsupported_default_fails_before_websocket_or_audio_attachment() -> None:
+    from livekit.plugins.spatius import AvatarExpression
+
+    sdk = MagicMock()
+    sdk.init = AsyncMock()
+    sdk.get_avatar_detail = AsyncMock(return_value=AvatarDetail(("calm", "happy"), "calm"))
+    sdk.start = AsyncMock()
+    sdk.close = AsyncMock()
+    room = MagicMock()
+    room.name = "test-room"
+    room.local_participant.identity = "test-agent"
+    agent_session = MagicMock()
+    avatar = _session(default_expression=AvatarExpression("unsupported", 0))
+    with (
+        patch("livekit.plugins.spatius.avatar.BaseAvatarSession.start", new=AsyncMock()),
+        patch("livekit.plugins.spatius.avatar.new_avatar_session", return_value=sdk),
+        pytest.raises(SpatiusException) as error,
+    ):
+        await avatar.start(
+            agent_session,
+            room,
+            livekit_url="wss://livekit.example.com",
+            livekit_api_key=_LIVEKIT_API_KEY,
+            livekit_api_secret=_LIVEKIT_API_SECRET,
+        )
+    assert isinstance(error.value.__cause__, ValueError)
+    sdk.get_avatar_detail.assert_awaited_once()
+    sdk.start.assert_not_awaited()
+    sdk.close.assert_awaited_once()
+    agent_session.output.replace_audio_tail.assert_not_called()
+    assert avatar._closed
+
+
+@pytest.mark.parametrize("emotion", [None, "happy"])
+async def test_default_override_preserves_zero_and_uses_discovered_labels(
+    emotion: str | None,
+) -> None:
+    from livekit.plugins.spatius import AvatarExpression
+
+    async with _started_avatar(
+        avatar_detail=AvatarDetail(("calm", "happy"), "calm"),
+        default_expression=AvatarExpression(emotion=emotion, strength=0),
+    ) as (avatar, *_):
+        assert avatar._expressions.default_expression == AvatarExpression(emotion or "calm", 0)
+        assert avatar.default_emotion == "calm"
+
+
+def test_default_expression_type_is_checked_immediately() -> None:
+    with pytest.raises(TypeError, match="default_expression"):
+        _session(default_expression={"emotion": "happy"})
+
+
+async def test_cancelled_discovery_closes_sdk_before_websocket_or_audio_attachment() -> None:
+    entered = asyncio.Event()
+
+    async def get_detail() -> AvatarDetail:
+        entered.set()
+        await asyncio.Future()
+        raise AssertionError("cancelled discovery resumed")
+
+    sdk = MagicMock()
+    sdk.init = AsyncMock()
+    sdk.get_avatar_detail = AsyncMock(side_effect=get_detail)
+    sdk.start = AsyncMock()
+    sdk.close = AsyncMock()
+    room = MagicMock()
+    room.name = "test-room"
+    room.local_participant.identity = "test-agent"
+    agent_session = MagicMock()
+    avatar = _session()
+    with (
+        patch("livekit.plugins.spatius.avatar.BaseAvatarSession.start", new=AsyncMock()),
+        patch("livekit.plugins.spatius.avatar.new_avatar_session", return_value=sdk),
+    ):
+        task = asyncio.create_task(
+            avatar.start(
+                agent_session,
+                room,
+                livekit_url="wss://livekit.example.com",
+                livekit_api_key=_LIVEKIT_API_KEY,
+                livekit_api_secret=_LIVEKIT_API_SECRET,
+            )
+        )
+        await asyncio.wait_for(entered.wait(), 1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    sdk.close.assert_awaited_once()
+    sdk.start.assert_not_awaited()
+    agent_session.output.replace_audio_tail.assert_not_called()
+    assert avatar._closed

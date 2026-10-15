@@ -1,7 +1,8 @@
-# Avatar emotion and strength: proposed plugin integration
+# Avatar emotion and strength: plugin integration
 
-Status: design only. The local V3 migration is implemented separately. The agreed
-first version selects one emotion and strength for each spoken reply, held until
+Status: implemented through the plugin’s public hook helpers and expression-aware
+audio output. The first version selects one emotion and strength for each spoken
+reply, held until
 that reply's audio request finishes or is interrupted. Sentence-level changes are
 outside this first version.
 
@@ -38,7 +39,7 @@ References in this checkout:
 - Official overview: https://docs.livekit.io/agents/models/tts/expressive/
 - Public hooks: https://docs.livekit.io/agents/logic/nodes/
 
-## Recommended first implementation
+## Implementation contract
 
 Keep all runtime changes in the Spatius plugin, using public Agent hooks from the
 application. No framework modification is needed for this scope.
@@ -88,7 +89,7 @@ numeric strength, for example:
 <avatar-expression emotion="happy" strength="0.5"/>I'm glad that worked!
 ```
 
-This is a proposed plugin syntax, not an existing LiveKit tag or implemented API.
+This is plugin control syntax, separate from LiveKit voice-expression markup.
 The application adds the short rule and allowed labels to its Agent instructions.
 The plugin helper parses the leading marker incrementally, handles split tokens,
 validates it, and removes it before sending text to TTS. A companion helper in
@@ -142,3 +143,22 @@ generation path; do not claim equivalent support for realtime audio models.
 The V3 SDK dependency is currently pinned to tested commit
 `731ecf164fe9f2dfd09825998c0624eeb9a001d8` for local development. Replace the Git
 dependency with the minimum released V3 SDK version before publishing the plugin.
+
+## Runtime and protocol limits
+
+Use `AvatarSession.tts_node`, `transcription_node`, and `expression_audio`; their
+public example and fallback behavior are documented in the plugin README. Tests
+cover parser bounds, explicit zero, continuous resampling, generation isolation,
+and serialized interrupt/audio ordering. The live test is opt-in and requires
+explicit environment credentials and a mono PCM fixture.
+
+The existing playback RPC has no request identifier. The plugin waits for an
+interrupt acknowledgement before sending replacement audio. The existing two-second
+timeout releases pending playback and closes the avatar session, so a delayed
+completion cannot finish a replacement reply. Start a new avatar session to recover
+from that timeout. An unsolicited server interruption also releases playback and
+closes the session. Continuing safely after an ambiguous timeout would require
+request identifiers in the playback protocol in a separate change.
+
+Automatic mapping from TTS-provider expression labels, sentence-level changes,
+and a public SDK helper for discovering avatar capabilities remain future work.

@@ -79,3 +79,113 @@ process initialization; without it, everything resolves inline as before.
 
 Session-token prefetch assumes the Spatius backend allows a token to back more than
 one session; opt out with `spatius.prewarm(proc, prefetch_session_token=False)`.
+
+## Emotion and strength
+
+The plugin discovers `availableEmotions` and `defaultEmotion` from the selected
+avatar's V3 detail API once during `avatar.start()` and retains them for the session.
+No `SPATIUS_EMOTIONS` or manual supported-label list is needed. Use the public Agent
+hooks to select one emotion and strength for each spoken reply, including all of
+its TTS sentence chunks. Tool preambles and subsequent answers can be separate
+replies. No LiveKit framework modifications are required.
+
+```python
+from collections.abc import AsyncIterable, AsyncIterator
+
+from livekit import rtc
+from livekit.agents import Agent, ModelSettings
+from livekit.agents.types import TimedString
+from livekit.plugins import spatius
+
+avatar = spatius.AvatarSession()
+
+
+class Assistant(Agent):
+    def __init__(self) -> None:
+        super().__init__(
+            instructions="You are a helpful assistant. " + avatar.expression_instructions
+        )
+
+    def tts_node(
+        self, text: AsyncIterable[str], model_settings: ModelSettings
+    ) -> AsyncIterator[rtc.AudioFrame]:
+        return avatar.tts_node(self, text, model_settings)
+
+    def transcription_node(
+        self, text: AsyncIterable[str | TimedString], model_settings: ModelSettings
+    ) -> AsyncIterator[str | TimedString]:
+        return avatar.transcription_node(text)
+
+
+# Discover capabilities before building the agent instructions:
+await avatar.start(session, room=ctx.room)
+await session.start(agent=Assistant(), room=ctx.room)
+```
+
+The instructions ask the LLM to begin each reply with a control marker such as
+`<avatar-expression emotion="happy" strength="0.5"/>`. The TTS helper removes
+avatar markers before synthesis, and the transcript helper removes them before
+display. Install **both** hooks. Existing LiveKit voice-expression markup remains
+available to the TTS provider; voice delivery and avatar expression are independent.
+Only the leading marker chooses the expression; later markers are removed without
+changing the active request.
+
+Strength must be a finite number from `0` to `1`. Explicit `0` is preserved;
+omitting strength uses the service default of `1`. Omitting emotion uses the
+avatar default. An optional `default_expression=AvatarExpression(...)` overrides
+that policy; a strength-only override retains the discovered default emotion.
+Explicit default labels are validated against the discovered list during startup.
+`avatar.available_emotions`, `avatar.default_emotion`, and
+`avatar.expression_instructions` are available after `avatar.start()`. Metadata
+lookup or validation failures stop startup before audio forwarding begins.
+Manually selected unsupported labels or invalid strengths raise an error. Missing, malformed, or unsupported LLM selections use
+`default_expression` (or the avatar default when unset). Parsing waits at most
+0.5 seconds for a partial prefix and accepts markers up to 1024 characters. An
+unclosed malformed tag is discarded until `>`, a newline, or 1024 discarded
+characters, then text resumes. This recovery cannot distinguish remaining broken
+attributes from ordinary speech, so use the generated instructions and valid tags.
+
+For scripted audio, select the expression on the audio stream itself:
+
+```python
+await session.say(
+    "I'm glad that worked!",
+    audio=avatar.expression_audio(
+        pcm_frames,
+        expression=spatius.AvatarExpression("happy", 0.5),
+    ),
+)
+```
+
+`expression_audio` accepts mono PCM frames, uses a continuous resampler to match
+the avatar session's rate, and retains one immutable selection for that invocation.
+It can also wrap a public `realtime_audio_output_node` implementation for manual
+selection. Realtime speech-to-speech models do not automatically emit the text
+control marker. To override the LLM selection for a TTS reply, pass `expression=`
+to `avatar.tts_node(...)` instead. Audio with no annotation uses the configured
+defaults. These APIs do not store a session-wide “next emotion,” so speculative
+or overlapping generations cannot change each other's selection.
+
+On normal interruption, replacement audio waits for the worker's acknowledgement.
+If that acknowledgement does not arrive within two seconds, pending playback is
+released and the avatar session closes. Start a new avatar session to recover;
+playback callbacks currently have no request identifier, so reusing a timed-out
+session could apply an old completion to a new reply. An unsolicited server
+interruption also closes the session.
+
+To run the opt-in transport integration test, configure the usual `LIVEKIT_*` and
+`SPATIUS_*` environment variables plus `SPATIUS_TEST_AUDIO_PCM` pointing to at least
+four seconds of non-silent raw 16 kHz mono signed 16-bit PCM, then run:
+
+```bash
+SPATIUS_RUN_LIVEKIT_TEST=1 uv run pytest \
+  livekit-plugins/livekit-plugins-spatius/tests/test_live_expression.py -q
+```
+
+The test creates and deletes a temporary LiveKit room. It exercises real SDK,
+ingress, audio delivery, playback RPCs, and interruption. Client rendering and
+motion-weight decoding are separate checks.
+
+See [the runnable example](../../examples/avatar/spatius_expression.py) and
+[the implementation notes](EMOTION_STRENGTH_PLAN.md). The SDK Git pin described
+above still needs a released version before publishing this plugin.

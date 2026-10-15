@@ -17,12 +17,14 @@
 from spatius import AudioFormat
 
 from .avatar import AvatarSession, SpatiusException
+from .expressions import AvatarExpression
 from .version import __version__
 from .warmup import prewarm
 
 __all__ = [
     "AudioFormat",
     "AvatarSession",
+    "AvatarExpression",
     "SpatiusException",
     "prewarm",
     "__version__",
