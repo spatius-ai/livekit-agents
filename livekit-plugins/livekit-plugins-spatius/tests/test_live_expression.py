@@ -95,7 +95,6 @@ async def test_expression_audio_through_real_livekit_playback(
     avatar = _PlaybackProbe(
         avatar_participant_identity=f"expression-avatar-{suffix}",
         sample_rate=24_000,
-        supported_emotions=["happy"],
         idle_timeout_seconds=120,
     )
     session: AgentSession[None] = AgentSession()
@@ -158,7 +157,7 @@ async def test_expression_audio_through_real_livekit_playback(
             assert audio_nonzero_frames > before_nonzero, "avatar audio was silent or not delivered"
             request_sends = sent_requests[before_sends:]
             assert request_sends, "reply did not reach the SDK"
-            expected_options: dict[str, Any] = {}
+            expected_options: dict[str, Any] = {"emotion": avatar.default_emotion}
             if expression is not None:
                 if expression.emotion is not None:
                     expected_options["emotion"] = expression.emotion
@@ -206,6 +205,12 @@ async def test_expression_audio_through_real_livekit_playback(
         phase = "avatar startup"
         await avatar.start(session, room)
         assert avatar._spatius_session is not None
+        assert avatar.default_emotion in avatar.available_emotions
+        selected_emotion = next(
+            (label for label in avatar.available_emotions if label != avatar.default_emotion),
+            avatar.default_emotion,
+        )
+        assert selected_emotion in avatar.expression_instructions
         original_send_audio = avatar._spatius_session.send_audio
 
         async def observe_send_audio(*, audio: bytes, end: bool, **options: Any) -> str:
@@ -234,16 +239,16 @@ async def test_expression_audio_through_real_livekit_playback(
         await avatar.wait_for_join(timeout=25)
         for label, expression in (
             ("default expression", None),
-            ("zero strength", AvatarExpression("happy", 0)),
-            ("half strength", AvatarExpression("happy", 0.5)),
-            ("full strength", AvatarExpression("happy", 1)),
+            ("zero strength", AvatarExpression(selected_emotion, 0)),
+            ("half strength", AvatarExpression(selected_emotion, 0.5)),
+            ("full strength", AvatarExpression(selected_emotion, 1)),
         ):
             phase = label
             await speak(expression)
         phase = "interruption"
-        await speak(AvatarExpression("happy", 0.5), interrupt=True)
+        await speak(AvatarExpression(selected_emotion, 0.5), interrupt=True)
         phase = "replacement after interruption"
-        await speak(AvatarExpression("happy", 0))
+        await speak(AvatarExpression(selected_emotion, 0))
         assert avatar.started_callbacks == 6
         assert avatar.finished_callbacks == 6
         assert len(playback_events) == 6

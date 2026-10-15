@@ -18,7 +18,7 @@ import asyncio
 import json
 import math
 import os
-from collections.abc import AsyncIterable, AsyncIterator, Sequence
+from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -40,6 +40,7 @@ from livekit.agents.voice.avatar import (
 from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 from spatius import (
     AudioFormat,
+    AvatarDetail,
     AvatarSession as SpatiusSDKSession,
     LiveKitTransportConfig,
     OggOpusEncoderConfig,
@@ -104,7 +105,6 @@ class AvatarSession(BaseAvatarSession):
         opus_frame_duration_ms: int = DEFAULT_OPUS_FRAME_DURATION_MS,
         opus_application: str = DEFAULT_OPUS_APPLICATION,
         extra_params: dict[str, str] | None = None,
-        supported_emotions: Sequence[str] | None = None,
         default_expression: AvatarExpression | None = None,
     ) -> None:
         super().__init__()
@@ -157,9 +157,11 @@ class AvatarSession(BaseAvatarSession):
             else None
         )
 
-        self._expressions = ExpressionController(
-            supported_emotions=supported_emotions, default_expression=default_expression
-        )
+        if default_expression is not None and not isinstance(default_expression, AvatarExpression):
+            raise TypeError("default_expression must be an AvatarExpression")
+        self._default_expression = default_expression
+        self._avatar_detail: AvatarDetail | None = None
+        self._expressions = ExpressionController()
         self._send_lock = asyncio.Lock()
         self._active_expression: _ExpressionMetadata | None = None
         self._interrupt_done = asyncio.Event()
@@ -183,9 +185,25 @@ class AvatarSession(BaseAvatarSession):
         return "spatius"
 
     @property
+    def available_emotions(self) -> tuple[str, ...]:
+        """Supported labels discovered when the avatar session starts."""
+        return self._require_avatar_detail().available_emotions
+
+    @property
+    def default_emotion(self) -> str:
+        """The avatar's default label, as returned by the service."""
+        return self._require_avatar_detail().default_emotion
+
+    @property
     def expression_instructions(self) -> str:
         """LLM instructions for one avatar expression per spoken reply."""
+        self._require_avatar_detail()
         return self._expressions.instructions
+
+    def _require_avatar_detail(self) -> AvatarDetail:
+        if self._avatar_detail is None:
+            raise SpatiusException("start the avatar session before reading its emotion metadata")
+        return self._avatar_detail
 
     def _expression_sample_rate(self) -> int:
         if self._audio is None or self._audio.sample_rate is None:
@@ -323,7 +341,19 @@ class AvatarSession(BaseAvatarSession):
                 on_close=self._on_spatius_close,
             )
             await self._spatius_session.init()
+            detail = await self._spatius_session.get_avatar_detail()
+            default = self._default_expression or AvatarExpression()
+            self._expressions = ExpressionController(
+                supported_emotions=detail.available_emotions,
+                default_expression=AvatarExpression(
+                    emotion=default.emotion
+                    if default.emotion is not None
+                    else detail.default_emotion,
+                    strength=default.strength,
+                ),
+            )
             await self._spatius_session.start()
+            self._avatar_detail = detail
 
             self._audio = ExpressionAudioOutput(
                 sample_rate=sample_rate, expressions=self._expressions
