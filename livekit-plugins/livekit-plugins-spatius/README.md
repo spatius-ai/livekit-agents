@@ -19,9 +19,21 @@ for a working implementation.
 
 ## Installation
 
+This checkout targets the V3 WebSocket API and currently pins the Spatius SDK
+commit tested with that protocol. Install the local plugin for development:
+
 ```bash
-pip install livekit-plugins-spatius
+uv pip install -e livekit-plugins/livekit-plugins-spatius
 ```
+
+The SDK pin is temporary until the V3 SDK is released. Before publishing this
+plugin, replace it with the minimum released V3 SDK version. The LiveKit room and
+avatar publisher identity come from a locally generated room token; the plugin
+passes that token to the SDK's `LiveKitTransportConfig`.
+
+Automatically resolved endpoints use V3. If `SPATIUS_INGRESS_ENDPOINT` is set,
+update any `/v2/driveningress` path to `/v3/driveningress`; the SDK appends
+`/websocket` and preserves explicit endpoint overrides.
 
 ## Usage
 
