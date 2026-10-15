@@ -3692,7 +3692,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "livekit-agents", editable = "livekit-agents" },
-    { name = "spatius", extras = ["opus"], specifier = ">=1.1.0" },
+    { name = "spatius", extras = ["opus"], git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=731ecf164fe9f2dfd09825998c0624eeb9a001d8" },
 ]
 
 [[package]]
@@ -6181,8 +6181,8 @@ wheels = [
 
 [[package]]
 name = "spatius"
-version = "1.1.0"
-source = { registry = "https://pypi.org/simple" }
+version = "1.1.2.dev7+g731ecf164"
+source = { git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=731ecf164fe9f2dfd09825998c0624eeb9a001d8#731ecf164fe9f2dfd09825998c0624eeb9a001d8" }
 dependencies = [
     { name = "aiohttp" },
     { name = "nanoid" },
@@ -6191,10 +6191,6 @@ dependencies = [
     { name = "opentelemetry-sdk" },
     { name = "protobuf" },
     { name = "websockets" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/27/e5/bcc84a81d1aa7254d91869f2ebac0bfdf6e9d3c43510ee98abee6b478d04/spatius-1.1.0.tar.gz", hash = "sha256:5b2d6ce92ce58172dc2ed98f5184de0e961f781ed390f7466b471836c2d04658", size = 160375, upload-time = "2026-08-28T11:45:57.494Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/22/73/b13dda4c6376aaeb4cd61eb0c0f340afa35582b81b9c97262f85f2d32064/spatius-1.1.0-py3-none-any.whl", hash = "sha256:887ee65021a7dd52470a29bd341b40b4a2ee9c21e423e59d011097329a460b34", size = 38519, upload-time = "2026-08-28T11:45:56.303Z" },
 ]
 
 [package.optional-dependencies]

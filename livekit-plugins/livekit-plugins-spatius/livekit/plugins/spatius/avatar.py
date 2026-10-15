@@ -38,7 +38,7 @@ from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 from spatius import (
     AudioFormat,
     AvatarSession as SpatiusSDKSession,
-    LiveKitEgressConfig,
+    LiveKitTransportConfig,
     OggOpusEncoderConfig,
     new_avatar_session,
 )
@@ -57,9 +57,6 @@ DEFAULT_SESSION_TTL = timedelta(hours=1)
 
 _AVATAR_AGENT_IDENTITY = "spatius-avatar-agent"
 _AVATAR_AGENT_NAME = "spatius-avatar-agent"
-# the backend egress consumes this participant attribute to route the playback
-# lifecycle RPCs back to the dispatched LiveKit Agents participant
-_LIVEKIT_AGENT_IDENTITY_ATTRIBUTE = "livekit_agent_identity"
 _RPC_PLAYBACK_STARTED = "lk.playback_started"
 _RPC_PLAYBACK_FINISHED = "lk.playback_finished"
 # fall back to finishing the segment locally if the worker never confirms an
@@ -212,9 +209,9 @@ class AvatarSession(BaseAvatarSession):
             },
         )
 
-        # the egress token joins the room as an agent, publishes the avatar tracks,
+        # the transport token joins the room as an agent, publishes the avatar tracks,
         # and publishes data so the worker can send the playback lifecycle RPCs
-        egress_token = (
+        transport_token = (
             api.AccessToken(api_key=lk_api_key, api_secret=lk_api_secret)
             .with_kind("agent")
             .with_identity(self._avatar_identity)
@@ -227,20 +224,19 @@ class AvatarSession(BaseAvatarSession):
                     room=room_name,
                     can_subscribe=False,
                     can_publish_data=True,
+                    can_update_own_metadata=True,
                     # the worker publishes exactly one avatar video and one audio track
                     can_publish_sources=["camera", "microphone"],
                 )
             )
             .to_jwt()
         )
-        livekit_egress = LiveKitEgressConfig(
+        transport = LiveKitTransportConfig(
             url=lk_url,
-            api_token=egress_token,
-            room_name=room_name,
-            publisher_id=self._avatar_identity,
+            token=transport_token,
+            agent_identity=agent_identity,
             extra_attributes={
                 ATTRIBUTE_PUBLISH_ON_BEHALF: agent_identity,
-                _LIVEKIT_AGENT_IDENTITY_ATTRIBUTE: agent_identity,
             },
             idle_timeout=self._idle_timeout_seconds,
         )
@@ -255,7 +251,7 @@ class AvatarSession(BaseAvatarSession):
                 console_endpoint_url=self._console_endpoint_url,
                 ingress_endpoint_url=self._ingress_endpoint_url,
                 expire_at=datetime.now(timezone.utc) + DEFAULT_SESSION_TTL,
-                livekit_egress=livekit_egress,
+                transport=transport,
                 sample_rate=sample_rate,
                 bitrate=self._bitrate,
                 audio_format=self._audio_format,
