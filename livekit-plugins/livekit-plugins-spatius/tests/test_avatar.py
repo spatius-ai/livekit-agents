@@ -181,7 +181,9 @@ async def test_audio_frames_and_end_are_forwarded_as_one_request() -> None:
 
 
 async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
-    async with _started_avatar() as (session, _, *_):
+    async with _started_avatar() as (session, sdk_session, *_):
+        sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **_: sent.set()
         assert session._audio is not None
         audio = session._audio
         started = MagicMock()
@@ -189,6 +191,7 @@ async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
         await audio.capture_frame(_frame())
         audio.flush()
 
+        await asyncio.wait_for(sent.wait(), timeout=1)
         started.assert_not_called()
         assert session._on_playback_started_rpc(_rpc("other-participant")) == "reject"
         assert session._on_playback_started_rpc(_rpc(session.avatar_identity)) == "ok"
@@ -215,14 +218,18 @@ async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
 @pytest.mark.parametrize("confirm_interrupt", [False, True])
 async def test_clear_buffer_interrupts_and_releases_playout(confirm_interrupt: bool) -> None:
     async with _started_avatar() as (session, sdk_session, *_):
+        sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **_: sent.set()
         assert session._audio is not None
         audio = session._audio
         await audio.capture_frame(_frame())
         audio.flush()
+        await asyncio.wait_for(sent.wait(), timeout=1)
+        interrupted = asyncio.Event()
+        sdk_session.interrupt.side_effect = lambda: interrupted.set()
         audio.clear_buffer()
         assert session._interrupt_atask is not None
-        await session._interrupt_atask
-        sdk_session.interrupt.assert_awaited_once()
+        await asyncio.wait_for(interrupted.wait(), timeout=1)
 
         if confirm_interrupt:
             assert (
@@ -234,6 +241,12 @@ async def test_clear_buffer_interrupts_and_releases_playout(confirm_interrupt: b
         else:
             session._cancel_clear_buffer_timeout()
             session._on_clear_buffer_timeout()
+        if confirm_interrupt:
+            await asyncio.wait_for(session._interrupt_atask, timeout=1.0)
+        else:
+            assert session._aclose_atask is not None
+            await asyncio.wait_for(session._aclose_atask, timeout=1.0)
+        sdk_session.interrupt.assert_awaited_once()
         result = await asyncio.wait_for(audio.wait_for_playout(), timeout=1.0)
         assert result.interrupted is True
         assert audio._pending_playback_count == 0
