@@ -18,21 +18,24 @@ import asyncio
 import json
 import math
 import os
+from collections.abc import AsyncIterable, AsyncIterator, Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from livekit import api, rtc
 from livekit.agents import (
     NOT_GIVEN,
+    Agent,
     AgentSession,
+    ModelSettings,
     NotGivenOr,
     get_job_context,
     utils,
 )
+from livekit.agents.types import TimedString
 from livekit.agents.voice.avatar import (
     AudioSegmentEnd,
     AvatarSession as BaseAvatarSession,
-    QueueAudioOutput,
 )
 from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 from spatius import (
@@ -43,6 +46,8 @@ from spatius import (
     new_avatar_session,
 )
 
+from .expression_output import ExpressionAudioOutput
+from .expressions import AvatarExpression, ExpressionController, _ExpressionMetadata
 from .log import logger
 
 # "auto" resolves the ingress region via the Spatius bootstrap API, falling back
@@ -99,6 +104,8 @@ class AvatarSession(BaseAvatarSession):
         opus_frame_duration_ms: int = DEFAULT_OPUS_FRAME_DURATION_MS,
         opus_application: str = DEFAULT_OPUS_APPLICATION,
         extra_params: dict[str, str] | None = None,
+        supported_emotions: Sequence[str] | None = None,
+        default_expression: AvatarExpression | None = None,
     ) -> None:
         super().__init__()
 
@@ -150,8 +157,17 @@ class AvatarSession(BaseAvatarSession):
             else None
         )
 
+        self._expressions = ExpressionController(
+            supported_emotions=supported_emotions, default_expression=default_expression
+        )
+        self._send_lock = asyncio.Lock()
+        self._active_expression: _ExpressionMetadata | None = None
+        self._interrupt_done = asyncio.Event()
+        self._interrupt_done.set()
+        self._interrupted_segments = 0
+        self._sent_segments = 0
         self._spatius_session: SpatiusSDKSession | None = None
-        self._audio: QueueAudioOutput | None = None
+        self._audio: ExpressionAudioOutput | None = None
         self._forward_atask: asyncio.Task[None] | None = None
         self._interrupt_atask: asyncio.Task[None] | None = None
         self._aclose_atask: asyncio.Task[None] | None = None
@@ -165,6 +181,52 @@ class AvatarSession(BaseAvatarSession):
     @property
     def provider(self) -> str:
         return "spatius"
+
+    @property
+    def expression_instructions(self) -> str:
+        """LLM instructions for one avatar expression per spoken reply."""
+        return self._expressions.instructions
+
+    def _expression_sample_rate(self) -> int:
+        if self._audio is None or self._audio.sample_rate is None:
+            raise SpatiusException("start the avatar session before generating expression audio")
+        return self._audio.sample_rate
+
+    def tts_node(
+        self,
+        agent: Agent,
+        text: AsyncIterable[str],
+        model_settings: ModelSettings,
+        *,
+        expression: AvatarExpression | None = None,
+    ) -> AsyncIterator[rtc.AudioFrame]:
+        """Use from Agent.tts_node to select and retain one expression for the reply."""
+        return self._expressions.tts_node(
+            agent,
+            text,
+            model_settings,
+            sample_rate=self._expression_sample_rate(),
+            expression=expression,
+        )
+
+    def transcription_node(
+        self, text: AsyncIterable[str | TimedString]
+    ) -> AsyncIterator[str | TimedString]:
+        """Remove avatar control markers from the displayed transcript."""
+        return self._expressions.transcription_node(text)
+
+    def expression_audio(
+        self,
+        audio: AsyncIterable[rtc.AudioFrame],
+        *,
+        expression: AvatarExpression | None = None,
+    ) -> AsyncIterator[rtc.AudioFrame]:
+        """Normalize and annotate one scripted or realtime audio reply."""
+        return self._expressions.expression_audio(
+            audio,
+            sample_rate=self._expression_sample_rate(),
+            expression=expression,
+        )
 
     async def start(
         self,
@@ -263,7 +325,9 @@ class AvatarSession(BaseAvatarSession):
             await self._spatius_session.init()
             await self._spatius_session.start()
 
-            self._audio = QueueAudioOutput(sample_rate=sample_rate, wait_playback_start=True)
+            self._audio = ExpressionAudioOutput(
+                sample_rate=sample_rate, expressions=self._expressions
+            )
             await self._audio.start()
             self._audio.on("clear_buffer", self._on_clear_buffer)  # type: ignore[arg-type]
 
@@ -297,16 +361,38 @@ class AvatarSession(BaseAvatarSession):
         audio, spatius = self._audio, self._spatius_session
         try:
             async for item in audio:
-                if isinstance(item, rtc.AudioFrame):
-                    await spatius.send_audio(audio=bytes(item.data), end=False)
-                elif isinstance(item, AudioSegmentEnd):
-                    await spatius.send_audio(audio=b"", end=True)
+                epoch = audio.epoch
+                interrupt = self._interrupt_atask
+                if interrupt is not None:
+                    await asyncio.shield(interrupt)
+                async with self._send_lock:
+                    if self._closed or self._aclose_atask is not None:
+                        return
+                    if epoch != audio.epoch:
+                        continue
+                    if isinstance(item, rtc.AudioFrame):
+                        metadata = audio.metadata(item)
+                        if audio.is_cancelled(metadata):
+                            continue
+                        options: dict[str, Any] = {}
+                        if self._active_expression is None:
+                            self._active_expression = metadata
+                            self._sent_segments += 1
+                            if metadata.expression.emotion is not None:
+                                options["emotion"] = metadata.expression.emotion
+                            if metadata.expression.strength is not None:
+                                options["strength"] = metadata.expression.strength
+                        elif self._active_expression != metadata:
+                            raise ValueError("avatar expression changed within an audio request")
+                        await spatius.send_audio(audio=bytes(item.data), end=False, **options)
+                    elif isinstance(item, AudioSegmentEnd) and self._active_expression is not None:
+                        await spatius.send_audio(audio=b"", end=True)
+                        self._active_expression = None
         except asyncio.CancelledError:
             raise
         except Exception:
-            # the ingress connection likely dropped; the SDK on_close callback
-            # tears the session down and releases any pending playback
             logger.warning("Spatius avatar audio forwarding stopped", exc_info=True)
+            self._on_spatius_close()
 
     def _on_playback_started_rpc(self, data: rtc.RpcInvocationData) -> str:
         if not self._is_avatar_caller(data, "playback-started"):
@@ -338,14 +424,33 @@ class AvatarSession(BaseAvatarSession):
             "Spatius avatar playback finished",
             extra={"playback_position": playback_position, "interrupted": interrupted},
         )
-        # forward every notification to the base AudioOutput, which does the 1:1
-        # segment accounting and ignores extras on its own
-        self._cancel_clear_buffer_timeout()
         if self._audio is not None:
-            self._audio.notify_playback_finished(
-                playback_position=max(0.0, playback_position),
-                interrupted=interrupted,
-            )
+            if self._interrupted_segments:
+                self._sent_segments = max(0, self._sent_segments - 1)
+                self._audio.notify_playback_finished(
+                    playback_position=max(0.0, playback_position), interrupted=True
+                )
+                self._interrupted_segments -= 1
+                if self._interrupted_segments == 0:
+                    self._cancel_clear_buffer_timeout()
+                    self._interrupt_done.set()
+            elif (
+                not interrupted
+                and self._sent_segments
+                and (self._interrupt_atask is None or self._interrupt_atask.done())
+            ):
+                self._sent_segments -= 1
+                self._audio.notify_playback_finished(
+                    playback_position=max(0.0, playback_position), interrupted=False
+                )
+            elif interrupted and self._sent_segments:
+                self._sent_segments -= 1
+                self._audio.notify_playback_finished(
+                    playback_position=max(0.0, playback_position), interrupted=True
+                )
+                # The server ended playback without our interrupt. Stop forwarding
+                # because the current request's remote state is no longer known.
+                self._on_spatius_close()
         return "ok"
 
     def _is_avatar_caller(self, data: rtc.RpcInvocationData, event: str) -> bool:
@@ -361,12 +466,11 @@ class AvatarSession(BaseAvatarSession):
         return False
 
     def _on_clear_buffer(self) -> None:
-        # the framework signals an interruption by clearing the output buffer:
-        # interrupt the avatar worker and wait for its playback-finished RPC,
-        # with a timeout fallback so wait_for_playout() cannot hang
         if self._audio is None or self._audio._pending_playback_count == 0:
             return
 
+        self._interrupted_segments = self._audio._pending_playback_count
+        self._interrupt_done.clear()
         if self._spatius_session is not None and (
             self._interrupt_atask is None or self._interrupt_atask.done()
         ):
@@ -379,11 +483,15 @@ class AvatarSession(BaseAvatarSession):
 
     def _on_clear_buffer_timeout(self) -> None:
         self._clear_buffer_timer = None
-        if self._audio is None or self._audio._pending_playback_count == 0:
-            return
-        logger.warning("no Spatius playback-finished RPC after interrupt; marking playout done")
-        self._audio.notify_playback_finished(playback_position=0.0, interrupted=True)
-        self._audio._reset_playback_count()
+        if self._audio is not None and self._interrupted_segments:
+            logger.warning("no Spatius playback-finished RPC after interrupt; marking playout done")
+            for _ in range(self._interrupted_segments):
+                self._audio.notify_playback_finished(playback_position=0.0, interrupted=True)
+        self._interrupted_segments = 0
+        self._interrupt_done.set()
+        # Playback RPCs carry no request ID. A delayed normal completion after
+        # this timeout could finish a replacement reply; require a new session.
+        self._on_spatius_close()
 
     def _cancel_clear_buffer_timeout(self) -> None:
         if self._clear_buffer_timer is not None:
@@ -394,10 +502,39 @@ class AvatarSession(BaseAvatarSession):
         if self._spatius_session is None:
             return
         try:
-            req_id = await self._spatius_session.interrupt()
-            logger.debug("interrupted Spatius avatar playback", extra={"request_id": req_id})
+            while self._audio is not None and self._aclose_atask is None:
+                epoch = self._audio.epoch
+                async with self._send_lock:
+                    # Queued audio may be cancelled before its first network send.
+                    unsent = max(0, self._interrupted_segments - self._sent_segments)
+                    for _ in range(unsent):
+                        self._audio.notify_playback_finished(
+                            playback_position=0.0, interrupted=True
+                        )
+                    self._interrupted_segments -= unsent
+                    if self._sent_segments == 0:
+                        self._active_expression = None
+                        self._cancel_clear_buffer_timeout()
+                        self._interrupt_done.set()
+                    else:
+                        req_id = await self._spatius_session.interrupt()
+                        self._active_expression = None
+                        logger.debug(
+                            "interrupted Spatius avatar playback", extra={"request_id": req_id}
+                        )
+                await self._interrupt_done.wait()
+                # Another clear can arrive after an acknowledgement wakes this
+                # task but before it resumes. Drain that cancellation too before
+                # releasing replacement audio through the barrier.
+                if epoch == self._audio.epoch:
+                    self._sent_segments = 0
+                    return
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            logger.debug("failed to interrupt Spatius avatar", exc_info=True)
+            logger.warning("failed to interrupt Spatius avatar", exc_info=True)
+            self._on_spatius_close()
+            raise
 
     def _on_spatius_error(self, error: Exception) -> None:
         logger.warning("Spatius avatar session error", exc_info=error)
@@ -449,6 +586,7 @@ class AvatarSession(BaseAvatarSession):
             self._agent_session.off("close", self._on_session_close)
 
         self._cancel_clear_buffer_timeout()
+        self._interrupt_done.set()
         if self._interrupt_atask is not None:
             await utils.aio.cancel_and_wait(self._interrupt_atask)
             self._interrupt_atask = None
@@ -463,6 +601,9 @@ class AvatarSession(BaseAvatarSession):
                 self._audio.notify_playback_finished(playback_position=0.0, interrupted=True)
             await self._audio.aclose()
             self._audio = None
+        self._active_expression = None
+        self._interrupted_segments = 0
+        self._sent_segments = 0
 
         if self._spatius_session is not None:
             try:
