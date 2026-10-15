@@ -3682,7 +3682,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "livekit-agents", editable = "livekit-agents" },
-    { name = "spatius", extras = ["opus"], git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=731ecf164fe9f2dfd09825998c0624eeb9a001d8" },
+    { name = "spatius", extras = ["opus"], git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=28947df62f07e01403a606aad6dd4df4bd5ae715" },
 ]
 
 [[package]]
@@ -6147,8 +6147,8 @@ wheels = [
 
 [[package]]
 name = "spatius"
-version = "1.1.2.dev7+g731ecf164"
-source = { git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=731ecf164fe9f2dfd09825998c0624eeb9a001d8#731ecf164fe9f2dfd09825998c0624eeb9a001d8" }
+version = "1.1.2.dev8+g28947df62"
+source = { git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=28947df62f07e01403a606aad6dd4df4bd5ae715#28947df62f07e01403a606aad6dd4df4bd5ae715" }
 dependencies = [
     { name = "aiohttp" },
     { name = "nanoid" },

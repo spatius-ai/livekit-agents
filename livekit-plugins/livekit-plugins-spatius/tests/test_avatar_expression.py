@@ -7,6 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
+from spatius import AvatarDetail
 
 from livekit import rtc
 from livekit.plugins.spatius import AvatarSession
@@ -20,6 +21,9 @@ async def _started_avatar(**kwargs: Any) -> AsyncIterator[tuple[Any, ...]]:
     sdk = MagicMock()
     for method in ("init", "start", "close", "send_audio", "interrupt"):
         setattr(sdk, method, AsyncMock())
+    sdk.get_avatar_detail = AsyncMock(
+        return_value=AvatarDetail(("neutral", "happy", "sad"), "neutral")
+    )
     room = MagicMock()
     room.name = "expression-test-room"
     room.local_participant.identity = "expression-test-agent"
@@ -75,7 +79,7 @@ def _finish_playback(session: Any, *, interrupted: bool = False) -> None:
 
 
 async def test_expression_selection_is_sent_once_for_the_whole_reply() -> None:
-    async with _started_avatar(supported_emotions={"neutral", "happy"}) as (session, sdk, *_):
+    async with _started_avatar() as (session, sdk, *_):
         sent_end = asyncio.Event()
 
         async def send_audio(**kwargs: Any) -> str:
@@ -107,7 +111,7 @@ async def test_expression_selection_is_sent_once_for_the_whole_reply() -> None:
 
 
 async def test_unannotated_reply_uses_default_without_leaking_previous_selection() -> None:
-    async with _started_avatar(supported_emotions={"neutral", "happy"}) as (session, sdk, *_):
+    async with _started_avatar() as (session, sdk, *_):
         sent_ends: asyncio.Queue[None] = asyncio.Queue()
 
         async def send_audio(**kwargs: Any) -> str:
@@ -134,14 +138,14 @@ async def test_unannotated_reply_uses_default_without_leaking_previous_selection
         assert sdk.send_audio.await_args_list == [
             call(audio=bytes(annotated[0].data), end=False, emotion="happy", strength=0.5),
             call(audio=b"", end=True),
-            call(audio=bytes(_frame().data), end=False),
+            call(audio=bytes(_frame().data), end=False, emotion="neutral"),
             call(audio=b"", end=True),
         ]
+        sdk.get_avatar_detail.assert_awaited_once()
 
 
 async def test_configured_default_is_applied_to_each_unannotated_reply() -> None:
     async with _started_avatar(
-        supported_emotions={"neutral", "happy"},
         default_expression=AvatarExpression("neutral", 0),
     ) as (session, sdk, *_):
         sent_ends: asyncio.Queue[None] = asyncio.Queue()
@@ -165,7 +169,7 @@ async def test_configured_default_is_applied_to_each_unannotated_reply() -> None
 
 
 async def test_overlapping_generators_keep_their_own_expression() -> None:
-    async with _started_avatar(supported_emotions={"happy", "sad"}) as (session, sdk, *_):
+    async with _started_avatar() as (session, sdk, *_):
         release_first = asyncio.Event()
         first_started = asyncio.Event()
         sent_ends: asyncio.Queue[None] = asyncio.Queue()
@@ -211,7 +215,7 @@ async def test_overlapping_generators_keep_their_own_expression() -> None:
 
 
 async def test_conflicting_generation_is_rejected_before_it_enters_the_queue() -> None:
-    async with _started_avatar(supported_emotions={"happy", "sad"}) as (session, sdk, *_):
+    async with _started_avatar() as (session, sdk, *_):
         first = [
             frame
             async for frame in session.expression_audio(
@@ -248,7 +252,7 @@ async def test_output_rejects_unexpected_audio_format(rate: int, channels: int) 
 
 
 async def test_interrupt_serializes_after_blocked_send_and_before_replacement() -> None:
-    async with _started_avatar(supported_emotions={"happy", "sad"}) as (session, sdk, *_):
+    async with _started_avatar() as (session, sdk, *_):
         old_started = asyncio.Event()
         release_old = asyncio.Event()
         interrupt_sent = asyncio.Event()
@@ -317,7 +321,7 @@ async def test_interrupt_serializes_after_blocked_send_and_before_replacement() 
 
 
 async def test_clearing_a_reply_fences_its_late_frames_without_poisoning_replacement() -> None:
-    async with _started_avatar(supported_emotions={"happy", "sad"}) as (session, sdk, *_):
+    async with _started_avatar() as (session, sdk, *_):
         first_sent = asyncio.Event()
         interrupt_sent = asyncio.Event()
         replacement_sent = asyncio.Event()
@@ -365,7 +369,7 @@ async def test_clearing_a_reply_fences_its_late_frames_without_poisoning_replace
 
 
 async def test_close_releases_old_and_replacement_segments_while_interrupt_waits() -> None:
-    async with _started_avatar(supported_emotions={"happy", "sad"}) as (session, sdk, *_):
+    async with _started_avatar() as (session, sdk, *_):
         first_sent = asyncio.Event()
         interrupt_sent = asyncio.Event()
 
@@ -396,7 +400,7 @@ async def test_close_releases_old_and_replacement_segments_while_interrupt_waits
 
 
 async def test_clear_before_first_send_completes_locally_and_preserves_session() -> None:
-    async with _started_avatar(supported_emotions={"happy"}) as (session, sdk, *_):
+    async with _started_avatar() as (session, sdk, *_):
         sent_end = asyncio.Event()
 
         async def send_audio(**kwargs: Any) -> str:

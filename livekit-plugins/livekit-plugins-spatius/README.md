@@ -82,9 +82,11 @@ one session; opt out with `spatius.prewarm(proc, prefetch_session_token=False)`.
 
 ## Emotion and strength
 
-Configure the selected avatar's exact supported labels once, then use the public
-Agent hooks. One emotion and strength applies to each spoken reply, including all
-of its TTS sentence chunks. Tool preambles and subsequent answers can be separate
+The plugin discovers `availableEmotions` and `defaultEmotion` from the selected
+avatar's V3 detail API once during `avatar.start()` and retains them for the session.
+No `SPATIUS_EMOTIONS` or manual supported-label list is needed. Use the public Agent
+hooks to select one emotion and strength for each spoken reply, including all of
+its TTS sentence chunks. Tool preambles and subsequent answers can be separate
 replies. No LiveKit framework modifications are required.
 
 ```python
@@ -95,10 +97,7 @@ from livekit.agents import Agent, ModelSettings
 from livekit.agents.types import TimedString
 from livekit.plugins import spatius
 
-avatar = spatius.AvatarSession(
-    supported_emotions=["neutral", "happy", "sad"],  # Use your avatar's actual labels.
-    default_expression=spatius.AvatarExpression("neutral"),
-)
+avatar = spatius.AvatarSession()
 
 
 class Assistant(Agent):
@@ -118,7 +117,7 @@ class Assistant(Agent):
         return avatar.transcription_node(text)
 
 
-# Start the avatar before generating speech:
+# Discover capabilities before building the agent instructions:
 await avatar.start(session, room=ctx.room)
 await session.start(agent=Assistant(), room=ctx.room)
 ```
@@ -133,8 +132,13 @@ changing the active request.
 
 Strength must be a finite number from `0` to `1`. Explicit `0` is preserved;
 omitting strength uses the service default of `1`. Omitting emotion uses the
-avatar default. Manually configured unsupported labels or invalid strengths raise
-an error. Missing, malformed, or unsupported LLM selections use
+avatar default. An optional `default_expression=AvatarExpression(...)` overrides
+that policy; a strength-only override retains the discovered default emotion.
+Explicit default labels are validated against the discovered list during startup.
+`avatar.available_emotions`, `avatar.default_emotion`, and
+`avatar.expression_instructions` are available after `avatar.start()`. Metadata
+lookup or validation failures stop startup before audio forwarding begins.
+Manually selected unsupported labels or invalid strengths raise an error. Missing, malformed, or unsupported LLM selections use
 `default_expression` (or the avatar default when unset). Parsing waits at most
 0.5 seconds for a partial prefix and accepts markers up to 1024 characters. An
 unclosed malformed tag is discarded until `>`, a newline, or 1024 discarded
