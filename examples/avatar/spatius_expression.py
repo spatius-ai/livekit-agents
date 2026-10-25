@@ -2,6 +2,8 @@
 
 Configure LIVEKIT_*, SPATIUS_*, STT_MODEL, LLM_MODEL, TTS_MODEL, and TTS_VOICE
 in the environment. Supported avatar emotions are discovered automatically.
+The LLM opens each reply with <expr type="expression" label="..." strength="..."/>;
+the framework strips it from transcripts and the TTS helper strips it before speech.
 """
 
 import os
@@ -17,7 +19,6 @@ from livekit.agents import (
     cli,
     inference,
 )
-from livekit.agents.types import TimedString
 from livekit.plugins import spatius
 
 server = AgentServer()
@@ -35,11 +36,6 @@ class ExpressiveAgent(Agent):
         self, text: AsyncIterable[str], model_settings: ModelSettings
     ) -> AsyncIterator[rtc.AudioFrame]:
         return self.avatar.tts_node(self, text, model_settings)
-
-    def transcription_node(
-        self, text: AsyncIterable[str | TimedString], model_settings: ModelSettings
-    ) -> AsyncIterator[str | TimedString]:
-        return self.avatar.transcription_node(text)
 
 
 @server.rtc_session()

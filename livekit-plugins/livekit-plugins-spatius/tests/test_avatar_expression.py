@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import math
+from array import array
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
@@ -11,7 +13,8 @@ from spatius import AvatarDetail
 
 from livekit import rtc
 from livekit.plugins.spatius import AvatarSession
-from livekit.plugins.spatius.expressions import AvatarExpression
+from livekit.plugins.spatius.expression_output import ExpressionAudioOutput
+from livekit.plugins.spatius.expressions import AvatarExpression, ExpressionController
 
 pytestmark = pytest.mark.unit
 
@@ -235,20 +238,117 @@ async def test_conflicting_generation_is_rejected_before_it_enters_the_queue() -
         assert session._audio._pending_playback_count == 1
 
 
-@pytest.mark.parametrize("rate,channels", [(16_000, 1), (24_000, 2)])
-async def test_output_rejects_unexpected_audio_format(rate: int, channels: int) -> None:
+async def test_output_rejects_multichannel_audio() -> None:
     async with _started_avatar() as (session, sdk, *_):
         frame = rtc.AudioFrame(
-            data=b"\0\0" * 480 * channels,
-            sample_rate=rate,
-            num_channels=channels,
-            samples_per_channel=480,
+            data=b"\0\0" * 480 * 2, sample_rate=24_000, num_channels=2, samples_per_channel=480
         )
         assert session._audio is not None
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="one channel"):
             await session._audio.capture_frame(frame)
         sdk.send_audio.assert_not_awaited()
         assert session._audio._pending_playback_count == 0
+
+
+async def test_output_leaves_resampling_out_of_the_framework() -> None:
+    audio = ExpressionAudioOutput(sample_rate=24_000, expressions=ExpressionController())
+    # the framework's resampler would drop the expression carried in frame userdata
+    assert audio.sample_rate is None
+    assert audio.target_sample_rate == 24_000
+
+
+def _tone(rate: int, samples: int, offset: int = 0) -> rtc.AudioFrame:
+    pcm = array(
+        "h",
+        (int(12_000 * math.sin(2 * math.pi * 440 * (offset + n) / rate)) for n in range(samples)),
+    )
+    return rtc.AudioFrame(pcm.tobytes(), rate, 1, samples)
+
+
+@pytest.mark.parametrize("rate", [16_000, 22_050, 48_000])
+async def test_output_resamples_continuously_and_sends_the_tail_before_end(rate: int) -> None:
+    async with _started_avatar() as (session, sdk, *_):
+        sent_end = asyncio.Event()
+        sdk.send_audio.side_effect = lambda **kwargs: sent_end.set() if kwargs["end"] else None
+        # uneven chunks spanning 100 ms; one resampler must carry state across them
+        boundaries = [0, 1, rate // 100, rate // 40, rate // 10]
+        frames = [
+            _tone(rate, end - start, start)
+            for start, end in zip(boundaries, boundaries[1:], strict=False)
+        ]
+        annotated = [
+            frame
+            async for frame in session.expression_audio(
+                _frames(*frames), expression=AvatarExpression("happy", 0.5)
+            )
+        ]
+        assert session._audio is not None
+        for frame in annotated:
+            await session._audio.capture_frame(frame)
+        session._audio.flush()
+        await asyncio.wait_for(sent_end.wait(), timeout=1)
+
+        calls = sdk.send_audio.await_args_list
+        assert calls[-1] == call(audio=b"", end=True)
+        audio_calls = calls[:-1]
+        assert audio_calls[0].kwargs["emotion"] == "happy"
+        assert audio_calls[0].kwargs["strength"] == 0.5
+        assert all("emotion" not in item.kwargs for item in audio_calls[1:])
+        sent = array("h", b"".join(item.kwargs["audio"] for item in audio_calls))
+        reference = rtc.AudioResampler(rate, 24_000)
+        expected = array(
+            "h",
+            b"".join(
+                bytes(f.data) for f in reference.push(_tone(rate, rate // 10)) + reference.flush()
+            ),
+        )
+        assert len(sent) == len(expected) == 2400
+        # independent SoXR instances apply integer-output dither
+        assert max(abs(a - b) for a, b in zip(sent, expected, strict=True)) <= 2
+        assert session._audio._pending_playback_count == 1
+
+
+async def test_short_reply_held_by_the_resampler_still_reaches_the_service() -> None:
+    async with _started_avatar() as (session, sdk, *_):
+        sent_end = asyncio.Event()
+        sdk.send_audio.side_effect = lambda **kwargs: sent_end.set() if kwargs["end"] else None
+        assert session._audio is not None
+        # 10 ms at 16 kHz: the resampler emits nothing until it is flushed
+        await session._audio.capture_frame(_tone(16_000, 160))
+        assert session._audio._pending_playback_count == 1
+        session._audio.flush()
+        await asyncio.wait_for(sent_end.wait(), timeout=1)
+        audio_calls = sdk.send_audio.await_args_list[:-1]
+        assert sum(len(item.kwargs["audio"]) for item in audio_calls) == 240 * 2
+        assert audio_calls[0].kwargs["emotion"] == "neutral"
+        _finish_playback(session)
+        await asyncio.wait_for(session._audio.wait_for_playout(), timeout=1)
+
+
+async def test_mid_reply_rate_change_flushes_the_old_resampler_first() -> None:
+    async with _started_avatar() as (session, sdk, *_):
+        sent_end = asyncio.Event()
+        sdk.send_audio.side_effect = lambda **kwargs: sent_end.set() if kwargs["end"] else None
+        assert session._audio is not None
+        await session._audio.capture_frame(_tone(16_000, 160))
+        await session._audio.capture_frame(_tone(24_000, 480))
+        session._audio.flush()
+        await asyncio.wait_for(sent_end.wait(), timeout=1)
+        sizes = [len(item.kwargs["audio"]) for item in sdk.send_audio.await_args_list[:-1]]
+        assert sizes == [240 * 2, 480 * 2]
+
+
+async def test_clear_discards_the_resampler_tail() -> None:
+    async with _started_avatar() as (session, sdk, *_):
+        assert session._audio is not None
+        audio = session._audio
+        await audio.capture_frame(_tone(16_000, 160))
+        audio.clear_buffer()
+        assert session._interrupt_atask is not None
+        await asyncio.wait_for(session._interrupt_atask, timeout=1)
+        sdk.send_audio.assert_not_awaited()
+        assert audio._pending_playback_count == 0
+        assert audio._resampler is None
 
 
 async def test_interrupt_serializes_after_blocked_send_and_before_replacement() -> None:

@@ -1,164 +1,87 @@
 # Avatar emotion and strength: plugin integration
 
-Status: implemented through the plugin’s public hook helpers and expression-aware
-audio output. The first version selects one emotion and strength for each spoken
-reply, held until
-that reply's audio request finishes or is interrupted. Sentence-level changes are
-outside this first version.
+Status: implemented in the plugin through public Agent hooks. Each spoken reply
+carries one emotion and strength, held until that reply's audio request finishes or
+is interrupted. Changes within a reply are out of scope: a V3 request carries one
+selection, and splitting a reply into several requests would break the
+one-request/one-playback-completion relationship.
 
-## Existing behavior
+## Selection syntax
 
-LiveKit expressive mode injects a TTS markup guide into the LLM prompt. The LLM
-emits delivery markers such as `<expr type="expression" label="happy"/>`; LiveKit
-converts them to the active provider's syntax and removes them from displayed
-transcripts. Provider support and expression vocabulary vary. The current fork
-enables the lowering path for inference gateway TTS and non-streaming providers
-adapted through `StreamAdapter`; arbitrary native-streaming TTS plugins are not
-automatically eligible.
-
-The `lk.expression` transcript attribute contains a display-oriented expression
-and mood. It has no numeric strength, no sample offset, and represents the first
-expression found in its transcript segment. It is unsuitable as the trigger for
-avatar inference, which needs its selection before the first audio request.
-
-The default `Agent.tts_node` yields `SynthesizedAudio.frame`, dropping the wrapper's
-request and segment IDs. The current Spatius queue consequently receives only
-`AudioFrame` values and an `AudioSegmentEnd`. These are the integration boundaries
-to extend inside the plugin.
-
-References in this checkout:
-
-- `livekit-agents/livekit/agents/voice/agent_activity.py`: `_resolve_expressive_options`,
-  `_inject_expressive_instructions`, raw LLM text forwarding.
-- `livekit-agents/livekit/agents/tts/_provider_format.py`: expression instructions,
-  normalization, provider lowering, `expression_attribute`.
-- `livekit-agents/livekit/agents/voice/agent.py`: public `tts_node` and
-  `transcription_node` hooks and their default implementations.
-- `livekit-agents/livekit/agents/voice/generation.py`: audio forwarding/resampling.
-- `livekit-agents/livekit/agents/voice/avatar/_queue_io.py`: queue and segment lifecycle.
-- Official overview: https://docs.livekit.io/agents/models/tts/expressive/
-- Public hooks: https://docs.livekit.io/agents/logic/nodes/
-
-## Implementation contract
-
-Keep all runtime changes in the Spatius plugin, using public Agent hooks from the
-application. No framework modification is needed for this scope.
-
-1. Add an immutable `AvatarExpression` value with `emotion` and optional `strength`.
-   Accept only supported avatar labels and finite numeric strength in `[0, 1]`.
-   Preserve the SDK distinction between omitted strength (service default `1`)
-   and explicit `0`. Obtain available/default emotions once at startup through
-   an explicit capability configuration or a public SDK avatar-detail helper.
-   The current Python SDK has no such detail helper; adding one would be an SDK
-   change, not a LiveKit framework change. Avoid private SDK token attributes.
-
-2. Provide a plugin helper for the application's public `Agent.tts_node` override.
-   It chooses the expression before starting synthesis, then delegates to
-   `Agent.default.tts_node`. Snapshot the choice in that invocation, with a unique
-   generation ID. Use the logical spoken output segment as the request boundary;
-   a tool preamble and a later generated answer can be separate spoken replies.
-   Do not create new backend requests for each PCM packet or TTS sentence chunk.
-
-3. Normalize audio to the plugin output's configured rate with a continuous
-   resampler scoped to the reply, flush its final samples, and only then attach
-   the immutable selection and generation ID under a namespaced
-   `AudioFrame.userdata` key. This avoids LiveKit's downstream resampler discarding
-   metadata. Copy unrelated user metadata and validate the configured channel
-   count. A rate mismatch must be observable and covered by tests.
-
-4. Use a plugin-owned queue/output extension to carry the selection with the
-   audio itself. On the first audio frame of the segment, call SDK
-   `send_audio(..., emotion=..., strength=...)`; later packets omit those options
-   and rely on the SDK's retained request selection. End the request on the
-   existing `AudioSegmentEnd`. Reject conflicting metadata within that request.
-   Audio without metadata uses explicit configured defaults or the avatar default.
-
-5. Preserve the existing one-request/one-playback-completion relationship. On
-   interruption, drop queued audio and its metadata together, fence cancelled
-   generation IDs, order the SDK interrupt before replacement audio, and retain
-   the existing completion timeout. Empty or cancelled speculative generations
-   must not leave a pending expression for the next reply. Close releases all
-   pending output state.
-
-## How the LLM chooses the values
-
-Use an explicit, leading plugin control marker with exact avatar labels and a
-numeric strength, for example:
+The LLM writes LiveKit's expressive markup with an optional strength attribute:
 
 ```text
-<avatar-expression emotion="happy" strength="0.5"/>I'm glad that worked!
+<expr type="expression" label="happy" strength="0.5"/>I'm glad that worked!
 ```
 
-This is plugin control syntax, separate from LiveKit voice-expression markup.
-The application adds the short rule and allowed labels to its Agent instructions.
-The plugin helper parses the leading marker incrementally, handles split tokens,
-validates it, and removes it before sending text to TTS. A companion helper in
-the public transcription hook removes the control marker from displayed text.
-Existing TTS delivery markup remains available to LiveKit expressive mode.
+Reusing the framework's marker, rather than a plugin-specific one, means:
 
-Only the leading selection affects a reply. Later avatar markers cannot change
-an active backend request. Missing, malformed, unsupported, or nonfinite values
-fall back to the configured/avatar default; record a generic diagnostic. Bound
-the prefix parser's size and waiting time so malformed model output cannot hold
-speech indefinitely. Do not wait for a complete reply or add a second LLM call.
+- The framework's transcript sinks (`TranscriptMarkupStripper`) already strip it,
+  so no transcription hook is needed. When expressive mode is off, the framework
+  also scrubs `<expr>` markup from past assistant turns before each LLM call, so
+  the LLM relies on the instructions rather than on its earlier markers.
+- With expressive mode active, the same marker is lowered to the TTS provider's
+  native voice controls, so one marker steers both voice and avatar.
+- The framework's expr grammar parses attributes generically. Provider lowering
+  reads only `type` and `label`, and the Gemini plugin's style extraction matches
+  extra attributes, so `strength` passes through every path and is dropped from
+  voice lowering. `tests/test_expressions.py` pins this behavior.
 
-The avatar directive works independently of whether the TTS supports expressive
-mode. Voice delivery and facial expression may intentionally differ. An optional
-future adapter can map known LiveKit expression labels to configured avatar
-labels and strengths, but it must not pretend that a display mood supplies a
-precise numeric intensity. Do not infer strength from audio amplitude.
+Without expressive mode the framework does not lower markup, so `tts_node` strips
+every `<expr>` tag before synthesis. With it, all markup is forwarded unchanged.
 
-Provide manual/application selection using the same value object for scripted
-speech and realtime speech-to-speech agents. Automatic markers require a text
-generation path; do not claim equivalent support for realtime audio models.
+Only the first expression marker of a reply selects the avatar expression. Other
+leading markup (sounds, pauses) is skipped while looking for it; later expression
+markers steer the voice only. Parsing is lenient: labels match discovered emotions
+ignoring case and separator style, a free-form label selects the earliest
+discovered emotion it names as a whole word, a missing or unreadable strength keeps
+the configured default, and an out-of-range strength is clamped. A marker naming no
+discovered emotion, or a missing marker, falls back to the configured or avatar
+default. Prefix parsing waits at most 0.5 seconds after the first text token and
+reads at most 1024 characters.
+
+## Discovery
+
+`avatar.start()` fetches the avatar detail once through the SDK's
+`get_avatar_detail()`. Its `availableEmotions` (in service order) feed validation,
+label matching, and `expression_instructions`; `defaultEmotion` is the fallback
+emotion. Failed or cancelled discovery stops startup before audio output is attached.
+
+## Carrying the selection with the audio
+
+`tts_node` snapshots the selection with a unique generation ID and attaches it to
+every frame under a namespaced `AudioFrame.userdata` key. `ExpressionAudioOutput`
+reports no `sample_rate`, because the framework's resampler builds new frames and
+drops `userdata`; it resamples to the session rate itself with one continuous
+resampler per reply, flushing the tail before the segment end. The output opens a
+playback segment on the first input frame, since the resampler may hold back all of
+a short reply until flush.
+
+The forwarder sends emotion and strength on the first SDK `send_audio` call of a
+request and relies on the SDK to retain them for later packets; `AudioSegmentEnd`
+ends the request. Conflicting metadata within a segment is rejected. Audio without
+metadata uses the configured or avatar default.
+
+## Interruption and completion
+
+Interruption fences cancelled generation IDs, discards the resampler tail, orders
+the SDK interrupt before replacement audio, and waits for the worker's playback
+acknowledgement. The playback RPC has no request identifier, so a missing
+acknowledgement after two seconds releases pending playback and closes the avatar
+session; a new session is required. An unsolicited server interruption also closes
+the session.
 
 ## Why simpler alternatives are insufficient
 
-- Listening to `lk.expression` is too late for reliable inference configuration
-  and loses strength and exact synthesis correlation.
-- A mutable global `current_emotion`, a `next_emotion` slot, or an uncorrelated
-  FIFO can apply a speculative/future reply's selection to earlier audio.
-- `session.current_speech` refers to current playout, which may differ from the
-  TTS generation already running ahead of it.
-- Starting a new backend request whenever an inline sentence marker arrives
-  requires additional audio segmentation and aggregation of playback callbacks.
-  It is not part of the selected one-expression-per-reply implementation.
+- Listening to `lk.expression` is too late for request configuration and has no
+  strength.
+- A mutable session-wide "next emotion" can apply a speculative or later reply's
+  selection to earlier audio.
+- A separate data-channel emotion message, as some avatar plugins use, is not
+  synchronized with the audio request.
 
-## Verification and implementation order
+## Remaining work
 
-1. Add value validation and metadata-aware queue behavior. Verify explicit zero,
-   omitted defaults, unsupported labels, frozen per-request selection, completion,
-   close, and interruption ordering.
-2. Add public-hook helpers and the bounded streaming parser. Verify split tags,
-   ordinary text, malformed headers, transcript cleanup, and coexistence with TTS
-   delivery markup without speaking the avatar directive.
-3. Cover resampling, final tails, multiple TTS chunks, two overlapping/speculative
-   generations, cancelled/empty replies, handoffs, and a late playback callback.
-   Assert that each emitted audio request receives the intended selection once
-   and produces one logical playback completion.
-4. Add an example with one expression per reply. Exercise real V3 WebSocket and
-   LiveKit delivery for default, zero, half, and full strength, plus interruption.
-   Validate motion emotion weights and client rendering separately.
-
-The V3 SDK dependency is currently pinned to tested commit
-`731ecf164fe9f2dfd09825998c0624eeb9a001d8` for local development. Replace the Git
-dependency with the minimum released V3 SDK version before publishing the plugin.
-
-## Runtime and protocol limits
-
-Use `AvatarSession.tts_node`, `transcription_node`, and `expression_audio`; their
-public example and fallback behavior are documented in the plugin README. Tests
-cover parser bounds, explicit zero, continuous resampling, generation isolation,
-and serialized interrupt/audio ordering. The live test is opt-in and requires
-explicit environment credentials and a mono PCM fixture.
-
-The existing playback RPC has no request identifier. The plugin waits for an
-interrupt acknowledgement before sending replacement audio. The existing two-second
-timeout releases pending playback and closes the avatar session, so a delayed
-completion cannot finish a replacement reply. Start a new avatar session to recover
-from that timeout. An unsolicited server interruption also releases playback and
-closes the session. Continuing safely after an ambiguous timeout would require
-request identifiers in the playback protocol in a separate change.
-
-Automatic mapping from TTS-provider expression labels, sentence-level changes,
-and a public SDK helper for discovering avatar capabilities remain future work.
+- Replace the SDK Git pin with the minimum released V3 SDK version before publishing.
+- Realtime speech-to-speech models emit no text marker; they use `expression_audio`
+  with a manual selection.

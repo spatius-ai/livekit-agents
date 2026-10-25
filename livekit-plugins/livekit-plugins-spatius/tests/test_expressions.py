@@ -12,6 +12,11 @@ import pytest
 
 from livekit import rtc
 from livekit.agents import Agent
+from livekit.agents.tts._provider_format import (
+    TranscriptMarkupStripper,
+    convert_markup,
+    split_expr_markup,
+)
 from livekit.agents.types import USERDATA_TIMED_TRANSCRIPT, TimedString
 from livekit.agents.voice.agent import ModelSettings
 from livekit.plugins.spatius import expressions
@@ -22,6 +27,8 @@ from livekit.plugins.spatius.expressions import (
 )
 
 pytestmark = pytest.mark.unit
+
+HAPPY = '<expr type="expression" label="happy" strength="0.5"/>'
 
 
 def _frame(
@@ -40,11 +47,19 @@ async def _chunks(*values: Any) -> AsyncIterator[Any]:
         yield value
 
 
+def _agent(*, expressive: bool) -> MagicMock:
+    agent = MagicMock()
+    activity = agent._get_activity_or_raise.return_value
+    activity._resolve_expressive_options.return_value = {} if expressive else None
+    return agent
+
+
 async def _render(
     text: AsyncIterable[str],
     *,
     controller: ExpressionController | None = None,
     expression: AvatarExpression | None = None,
+    expressive: bool = False,
 ) -> tuple[str, list[rtc.AudioFrame]]:
     spoken: list[str] = []
 
@@ -54,7 +69,7 @@ async def _render(
         async for value in source:
             spoken.append(value)
         if spoken:
-            yield _frame()
+            yield _frame(userdata={USERDATA_TIMED_TRANSCRIPT: [TimedString("Hello")]})
             yield _frame()
 
     controller = controller or ExpressionController(["neutral", "happy", "sad"])
@@ -62,7 +77,7 @@ async def _render(
         output = [
             frame
             async for frame in controller.tts_node(
-                MagicMock(), text, ModelSettings(), sample_rate=24_000, expression=expression
+                _agent(expressive=expressive), text, ModelSettings(), expression=expression
             )
         ]
     return "".join(spoken), output
@@ -109,61 +124,134 @@ def test_controller_requires_explicit_supported_labels() -> None:
         ExpressionController(default_expression=False)  # type: ignore[arg-type]
     controller = ExpressionController(["neutral", "happy"], AvatarExpression("neutral", 0.5))
     assert controller.default_expression == AvatarExpression("neutral", 0.5)
-    assert '"happy"' in controller.instructions
-    assert '"neutral"' in controller.instructions
     assert ExpressionController().instructions == ""
 
 
-async def test_leading_directive_survives_every_token_boundary() -> None:
-    marker = '<avatar-expression emotion="happy" strength="0"/>'
-    for split in range(len(marker) + 1):
-        spoken, frames = await _render(_chunks(marker[:split], marker[split:] + "Hello!"))
+def test_instructions_teach_expr_markup_in_service_order_without_braces() -> None:
+    instructions = ExpressionController(["sad", "happy_exaggerated", "anger"]).instructions
+    assert '<expr type="expression" label="LABEL" strength="NUMBER"/>' in instructions
+    assert '["sad", "happy_exaggerated", "anger"]' in instructions
+    # safe inside the expressive template, which formats {placeholders}
+    assert "{" not in instructions and "}" not in instructions
+
+
+@pytest.mark.parametrize(
+    "label,expected",
+    [
+        ("happy", "happy"),
+        ("HAPPY", "happy"),
+        (" happy ", "happy"),
+        ("happy_exaggerated", "happy_exaggerated"),
+        ("happy exaggerated", "happy_exaggerated"),
+        ("Happy-Exaggerated", "happy_exaggerated"),
+        ("warm, happy", "happy"),
+        ("happy but a little sad", "happy"),
+        ("very happy_exaggerated", "happy_exaggerated"),
+        ("unhappy", None),
+        ("sadly", None),
+        ("surprised", None),
+        ("", None),
+    ],
+)
+def test_label_matching_is_lenient_but_whole_word(label: str, expected: str | None) -> None:
+    controller = ExpressionController(["neutral", "happy", "happy_exaggerated", "sad"])
+    assert controller.match_emotion(label) == expected
+
+
+async def test_leading_marker_survives_every_token_boundary() -> None:
+    for split in range(len(HAPPY) + 1):
+        spoken, frames = await _render(_chunks(HAPPY[:split], HAPPY[split:] + "Hello!"))
         assert spoken == "Hello!"
-        assert [_selection(frame) for frame in frames] == [AvatarExpression("happy", 0)] * 2
+        assert [_selection(frame) for frame in frames] == [AvatarExpression("happy", 0.5)] * 2
         assert (
             frames[0].userdata[_EXPRESSION_USERDATA_KEY]
             is frames[1].userdata[_EXPRESSION_USERDATA_KEY]
         )
 
 
-async def test_only_leading_directive_selects_expression_and_voice_markers_survive() -> None:
-    spoken, frames = await _render(
-        _chunks(
-            '  <avatar-expression emotion="happy" strength="0.5"/>',
-            '<expr type="expression" label="sad"/>Hello ',
-            "<avatar-exp",
-            'ression emotion="sad" strength="1"/>world.',
-            "</avatar-expression>",
-        )
-    )
-    assert spoken == '  <expr type="expression" label="sad"/>Hello world.'
-    assert _selection(frames[0]) == AvatarExpression("happy", 0.5)
+@pytest.mark.parametrize(
+    "marker,expected",
+    [
+        ('<expr type="expression" label="happy"/>', AvatarExpression("happy", 0.25)),
+        ('<expr type="expression" label="happy" strength="0"/>', AvatarExpression("happy", 0)),
+        ('<expr strength="1" label="happy" type="expression"/>', AvatarExpression("happy", 1)),
+        ('<expr type="expression" label="happy" strength="1.5"/>', AvatarExpression("happy", 1)),
+        ('<expr type="expression" label="happy" strength="-2"/>', AvatarExpression("happy", 0)),
+        ('<expr type="expression" label="happy" strength="nan"/>', AvatarExpression("happy", 0.25)),
+        (
+            '<expr type="expression" label="happy" strength="lots"/>',
+            AvatarExpression("happy", 0.25),
+        ),
+        ("<expr type='expression' label='happy' strength='0.5'/>", AvatarExpression("happy", 0.5)),
+        ('<expr type="expression" label="happy" strength="0.5">', AvatarExpression("happy", 0.5)),
+        ('<expr label="happy"/>', AvatarExpression("happy", 0.25)),
+        ('<expr type="expression" label="warm, happy"/>', AvatarExpression("happy", 0.25)),
+        ('<expr type="EXPRESSION" LABEL="Happy"/>', AvatarExpression("happy", 0.25)),
+    ],
+)
+async def test_lenient_marker_parsing(marker: str, expected: AvatarExpression) -> None:
+    controller = ExpressionController(["neutral", "happy"], AvatarExpression("neutral", 0.25))
+    spoken, frames = await _render(_chunks(marker + "Hello"), controller=controller)
+    assert spoken == "Hello"
+    assert _selection(frames[0]) == expected
 
 
 @pytest.mark.parametrize(
     "marker",
     [
-        '<avatar-expression emotion="other" strength="0.5"/>',
-        '<avatar-expression emotion="happy" strength="nan"/>',
-        '<avatar-expression emotion="happy" strength="inf"/>',
-        '<avatar-expression emotion="happy" strength="1.1"/>',
-        '<avatar-expression emotion="happy"/>',
-        '<avatar-expression emotion="happy" emotion="sad" strength="0.5"/>',
-        '<avatar-expression emotion="happy" strength="0.5">',
-        "<avatar-expression malformed=yes/>",
-        '<AVATAR-EXPRESSION emotion="happy" strength="0.5"/>',
+        '<expr type="expression" label="other" strength="0.5"/>',
+        '<expr type="expression" label="unhappy"/>',
+        '<expr type="expression" strength="0.5"/>',
     ],
 )
-async def test_invalid_marker_is_removed_and_uses_default(marker: str, caplog: Any) -> None:
+async def test_unresolved_marker_is_removed_and_uses_default(marker: str, caplog: Any) -> None:
     controller = ExpressionController(["neutral", "happy"], AvatarExpression("neutral", 0.25))
     spoken, frames = await _render(_chunks(marker + "Hello"), controller=controller)
     assert spoken == "Hello"
     assert _selection(frames[0]) == AvatarExpression("neutral", 0.25)
-    assert "using configured defaults" in caplog.text
+    assert "names no supported emotion" in caplog.text
     assert marker not in caplog.text
 
 
-@pytest.mark.parametrize("text", ["Hello!", "1 < 2", '<expr label="happy"/>', "x" * 5000])
+async def test_missing_marker_warns_and_uses_default(caplog: Any) -> None:
+    spoken, frames = await _render(_chunks("Hello"))
+    assert spoken == "Hello"
+    assert _selection(frames[0]) == AvatarExpression()
+    assert "no leading avatar expression marker" in caplog.text
+
+
+async def test_other_leading_markup_is_skipped_to_find_the_expression() -> None:
+    spoken, frames = await _render(
+        _chunks(' <expr type="sound" label="laugh"/> <expr type="break" label="200ms"/>', HAPPY),
+        expressive=True,
+    )
+    assert spoken.endswith(HAPPY)
+    assert _selection(frames[0]) == AvatarExpression("happy", 0.5)
+
+
+async def test_only_first_expression_marker_selects_and_later_markup_is_stripped() -> None:
+    spoken, frames = await _render(
+        _chunks(
+            HAPPY,
+            'Hello <expr type="expression" label="sad" strength="1"/>world ',
+            '<expr type="prosody" label="slow">and</expr> <ex',
+            'pr type="sound" label="laugh"/>bye.',
+        )
+    )
+    assert spoken == "Hello world and bye."
+    assert _selection(frames[0]) == AvatarExpression("happy", 0.5)
+
+
+async def test_expressive_mode_forwards_all_markup_to_the_tts() -> None:
+    raw = [HAPPY, 'Hello <expr type="expression" label="sad"/>world <exp', 'r type="sound"/>.']
+    spoken, frames = await _render(_chunks(*raw), expressive=True)
+    assert spoken == "".join(raw)
+    assert _selection(frames[0]) == AvatarExpression("happy", 0.5)
+
+
+@pytest.mark.parametrize(
+    "text", ["Hello!", "1 < 2", "a <b>c</b>", "<expression>", "x" * 5000, "<e", "<expr"]
+)
 async def test_ordinary_text_is_preserved_with_default_selection(text: str) -> None:
     spoken, frames = await _render(_chunks(text))
     assert spoken == text
@@ -171,20 +259,25 @@ async def test_ordinary_text_is_preserved_with_default_selection(text: str) -> N
 
 
 async def test_large_chunk_with_short_valid_leading_marker_selects_expression() -> None:
-    spoken, frames = await _render(
-        _chunks('<avatar-expression emotion="happy" strength="0.5"/>' + "x" * 5000)
-    )
+    spoken, frames = await _render(_chunks(HAPPY + "x" * 5000))
     assert spoken == "x" * 5000
     assert _selection(frames[0]) == AvatarExpression("happy", 0.5)
 
 
-async def test_manual_expression_wins_but_all_directives_are_removed() -> None:
-    spoken, frames = await _render(
-        _chunks('<avatar-expression emotion="happy" strength="1"/>Hello'),
-        expression=AvatarExpression("sad", 0),
-    )
+async def test_manual_expression_wins_and_markup_is_still_stripped() -> None:
+    spoken, frames = await _render(_chunks(HAPPY + "Hello"), expression=AvatarExpression("sad", 0))
     assert spoken == "Hello"
     assert _selection(frames[0]) == AvatarExpression("sad", 0)
+
+
+async def test_manual_expression_must_be_supported() -> None:
+    with pytest.raises(ValueError, match="supported_emotions"):
+        await _render(_chunks("Hello"), expression=AvatarExpression("surprise"))
+
+
+async def test_tts_frames_keep_their_userdata() -> None:
+    _, frames = await _render(_chunks(HAPPY + "Hello"))
+    assert frames[0].userdata[USERDATA_TIMED_TRANSCRIPT] == ["Hello"]
 
 
 async def test_delayed_first_token_does_not_spend_the_prefix_parsing_budget(
@@ -195,7 +288,7 @@ async def test_delayed_first_token_does_not_spend_the_prefix_parsing_budget(
     async def source() -> AsyncIterator[str]:
         yield ""
         await asyncio.sleep(0.03)
-        yield '<avatar-expression emotion="happy" strength="0.5"/>Hello'
+        yield HAPPY + "Hello"
 
     spoken, frames = await _render(source())
     assert spoken == "Hello"
@@ -209,9 +302,9 @@ async def test_prefix_timeout_does_not_cancel_or_drop_pending_text(monkeypatch: 
     spoken: list[str] = []
 
     async def source() -> AsyncIterator[str]:
-        yield "<avatar-expr"
+        yield '<expr type="expr'
         await resume.wait()
-        yield 'ession emotion="happy" strength="1"/>Still spoken'
+        yield 'ession" label="happy" strength="1"/>Still spoken'
 
     async def tts(
         agent: Agent, text: AsyncIterable[str], model_settings: ModelSettings
@@ -225,7 +318,7 @@ async def test_prefix_timeout_does_not_cancel_or_drop_pending_text(monkeypatch: 
         return [
             frame
             async for frame in ExpressionController(["happy"]).tts_node(
-                MagicMock(), source(), ModelSettings(), sample_rate=24_000
+                _agent(expressive=False), source(), ModelSettings()
             )
         ]
 
@@ -242,24 +335,16 @@ async def test_prefix_timeout_does_not_cancel_or_drop_pending_text(monkeypatch: 
     assert _selection(frames[0]) == AvatarExpression()
 
 
-async def test_oversized_directive_and_truncated_markers_do_not_reach_speech() -> None:
-    marker = "<avatar-expression "
-    spoken, frames = await _render(
-        _chunks(
-            marker + "x" * (expressions._MAX_PREFIX_CHARS - len(marker)), "Hello", "<avatar-expr"
-        )
-    )
-    assert spoken == "Hello"
+async def test_oversized_marker_is_released_as_text_with_default_selection() -> None:
+    marker = '<expr type="expression" label="' + "x" * expressions._MAX_PREFIX_CHARS
+    spoken, frames = await _render(_chunks(marker, "Hello"))
+    assert spoken == marker + "Hello"
     assert _selection(frames[0]) == AvatarExpression()
 
 
-async def test_unclosed_marker_recovers_at_newline_for_speech_and_transcript() -> None:
-    chunks = ['<avatar-expression emotion="happy"', "\nHello"]
-    spoken, frames = await _render(_chunks(*chunks))
-    displayed = "".join(
-        [value async for value in ExpressionController().transcription_node(_chunks(*chunks))]
-    )
-    assert spoken == displayed == "\nHello"
+async def test_unclosed_marker_is_released_at_newline() -> None:
+    spoken, frames = await _render(_chunks('<expr type="expression" label="happy"', "\nHello"))
+    assert spoken == '<expr type="expression" label="happy"\nHello'
     assert _selection(frames[0]) == AvatarExpression()
 
 
@@ -270,7 +355,7 @@ async def test_cancelled_prefix_closes_upstream_and_does_not_affect_next_reply()
 
     async def source() -> AsyncIterator[str]:
         try:
-            yield "<avatar-expression"
+            yield "<expr"
             waiting.set()
             await asyncio.Event().wait()
         finally:
@@ -287,50 +372,34 @@ async def test_cancelled_prefix_closes_upstream_and_does_not_affect_next_reply()
     assert _selection(frames[0]) == AvatarExpression()
 
 
-async def test_transcript_cleanup_preserves_timed_string_metadata() -> None:
-    first = TimedString("<avatar-expr", start_time=0, end_time=0.1)
-    second = TimedString('ession emotion="happy" strength="0.5"/>', start_time=0.1, end_time=0.2)
-    spoken = TimedString(
-        'Hello <avatar-expression emotion="sad" strength="1"/>world',
-        start_time=1.0,
-        end_time=2.0,
-        confidence=0.8,
-        start_time_offset=10.0,
-        speaker_id="speaker",
-    )
-    output = [
-        value
-        async for value in ExpressionController().transcription_node(_chunks(first, second, spoken))
-    ]
-    assert "".join(output) == "Hello world"
-    assert all(isinstance(value, TimedString) for value in output)
-    assert all(value.__dict__ == spoken.__dict__ for value in output)
-    assert str(spoken).endswith('strength="1"/>world')
+@pytest.mark.parametrize(
+    "provider", ["cartesia", "inworld", "xai", "fishaudio", "fishaudio_drama", "gemini"]
+)
+def test_framework_markup_handling_ignores_strength(provider: str) -> None:
+    with_strength = convert_markup(provider, HAPPY + " Hello")
+    without = convert_markup(provider, '<expr type="expression" label="happy"/> Hello')
+    assert with_strength.replace(' strength="0.5"', "") == without
 
 
-async def test_transcript_and_tts_cleanup_agree_for_fragmented_and_malformed_tags() -> None:
-    raw = (
-        '<avatar-expression emotion="happy" strength="0.5"/>'
-        'Hello <expr type="expression" label="sad"/>there '
-        "<avatar-expression malformed>friend</avatar-expression><avatar-expr"
-    )
-    chunks = [raw[index : index + 3] for index in range(0, len(raw), 3)]
-    spoken, _ = await _render(_chunks(*chunks))
-    displayed = "".join(
-        [value async for value in ExpressionController().transcription_node(_chunks(*chunks))]
-    )
-    assert spoken == displayed == 'Hello <expr type="expression" label="sad"/>there friend'
+def test_framework_transcript_stripping_removes_marker_with_strength() -> None:
+    stripper = TranscriptMarkupStripper()
+    raw = HAPPY + " Hello there."
+    shown = "".join(stripper.push(raw[i : i + 5]) for i in range(0, len(raw), 5))
+    assert shown + stripper.flush() == "Hello there."
+    assert stripper.tags == [{"type": "expression", "value": "happy"}]
+    assert split_expr_markup(raw) == ("Hello there.", [{"type": "expression", "value": "happy"}])
 
 
-async def test_same_rate_audio_copies_userdata_and_isolated_frozen_metadata() -> None:
+async def test_expression_audio_copies_frames_and_shares_frozen_metadata() -> None:
     source = _frame(userdata={"custom": "value"})
     controller = ExpressionController(["happy"])
     output = [
         frame
         async for frame in controller.expression_audio(
-            _chunks(source, source), sample_rate=24_000, expression=AvatarExpression("happy", 0)
+            _chunks(source, _frame(samples=[]), source), expression=AvatarExpression("happy", 0)
         )
     ]
+    assert len(output) == 2
     assert bytes(output[0].data) == bytes(source.data)
     assert source.userdata == {"custom": "value"}
     assert output[0].userdata["custom"] == "value"
@@ -341,43 +410,12 @@ async def test_same_rate_audio_copies_userdata_and_isolated_frozen_metadata() ->
         output[0].userdata[_EXPRESSION_USERDATA_KEY].generation_id = "changed"
 
 
-async def test_resampler_is_continuous_flushes_tail_and_keeps_transcripts_once() -> None:
-    samples = [int(16000 * math.sin(2 * math.pi * 440 * n / 22050)) for n in range(2205)]
-    boundaries = [0, 1, 24, 724, len(samples)]
-    source = [
-        _frame(
-            samples[start:end],
-            rate=22_050,
-            userdata={USERDATA_TIMED_TRANSCRIPT: [TimedString(str(index))], "custom": "value"},
-        )
-        for index, (start, end) in enumerate(zip(boundaries, boundaries[1:], strict=False))
-    ]
+async def test_expression_audio_leaves_the_sample_rate_to_the_output() -> None:
     output = [
         frame
-        async for frame in ExpressionController(["happy"]).expression_audio(
-            _chunks(*source), sample_rate=24_000, expression=AvatarExpression("happy", 0.5)
-        )
+        async for frame in ExpressionController().expression_audio(_chunks(_frame(rate=16_000)))
     ]
-    reference = rtc.AudioResampler(22_050, 24_000)
-    expected = reference.push(_frame(samples, rate=22_050)) + reference.flush()
-    assert sum(frame.samples_per_channel for frame in output) == 2400
-    actual_samples = array("h", b"".join(bytes(frame.data) for frame in output))
-    expected_samples = array("h", b"".join(bytes(frame.data) for frame in expected))
-    # Independent SoXR instances apply integer-output dither.
-    assert (
-        max(
-            abs(actual - expected)
-            for actual, expected in zip(actual_samples, expected_samples, strict=True)
-        )
-        <= 2
-    )
-    assert all(frame.sample_rate == 24_000 for frame in output)
-    assert all(_selection(frame) == AvatarExpression("happy", 0.5) for frame in output)
-    assert len({id(frame.userdata[_EXPRESSION_USERDATA_KEY]) for frame in output}) == 1
-    assert [
-        item for frame in output for item in frame.userdata.get(USERDATA_TIMED_TRANSCRIPT, [])
-    ] == ["0", "1", "2", "3"]
-    assert all(frame.userdata.get("custom") == "value" for frame in output[:-1])
+    assert output[0].sample_rate == 16_000
 
 
 async def test_overlapping_audio_generations_keep_independent_selections() -> None:
@@ -389,12 +427,8 @@ async def test_overlapping_audio_generations_keep_independent_selections() -> No
         yield _frame()
 
     controller = ExpressionController(["happy", "sad"])
-    first = controller.expression_audio(
-        source(), sample_rate=24_000, expression=AvatarExpression("happy", 0)
-    )
-    second = controller.expression_audio(
-        source(), sample_rate=24_000, expression=AvatarExpression("sad", 1)
-    )
+    first = controller.expression_audio(source(), expression=AvatarExpression("happy", 0))
+    second = controller.expression_audio(source(), expression=AvatarExpression("sad", 1))
     try:
         a, b = await asyncio.gather(anext(first), anext(second))
         assert _selection(a) == AvatarExpression("happy", 0)
@@ -423,9 +457,7 @@ async def test_cancelled_and_empty_audio_do_not_leak_selection_into_next_reply()
         finally:
             closed.set()
 
-    audio = controller.expression_audio(
-        source(), sample_rate=24_000, expression=AvatarExpression("happy", 1)
-    )
+    audio = controller.expression_audio(source(), expression=AvatarExpression("happy", 1))
     previous = await anext(audio)
     waiting = asyncio.create_task(anext(audio))
     await asyncio.sleep(0)
@@ -436,41 +468,11 @@ async def test_cancelled_and_empty_audio_do_not_leak_selection_into_next_reply()
     assert [
         frame
         async for frame in controller.expression_audio(
-            _chunks(), sample_rate=24_000, expression=AvatarExpression("happy", 1)
+            _chunks(), expression=AvatarExpression("happy", 1)
         )
     ] == []
-    next_frame = [
-        frame async for frame in controller.expression_audio(_chunks(_frame()), sample_rate=24_000)
-    ][0]
+    next_frame = [frame async for frame in controller.expression_audio(_chunks(_frame()))][0]
     assert _selection(next_frame) == AvatarExpression()
     assert (
         previous.userdata[_EXPRESSION_USERDATA_KEY] != next_frame.userdata[_EXPRESSION_USERDATA_KEY]
     )
-
-
-@pytest.mark.parametrize("sample_rate", [0, -1, True, 24_000.5])
-async def test_invalid_output_rate_is_rejected(sample_rate: Any) -> None:
-    with pytest.raises(ValueError, match="positive integer"):
-        _ = [
-            frame
-            async for frame in ExpressionController().expression_audio(
-                _chunks(_frame()), sample_rate=sample_rate
-            )
-        ]
-
-
-async def test_stereo_audio_and_mid_reply_rate_change_are_rejected() -> None:
-    with pytest.raises(ValueError, match="mono"):
-        _ = [
-            frame
-            async for frame in ExpressionController().expression_audio(
-                _chunks(_frame(channels=2)), sample_rate=24_000
-            )
-        ]
-    with pytest.raises(ValueError, match="remain constant"):
-        _ = [
-            frame
-            async for frame in ExpressionController().expression_audio(
-                _chunks(_frame(), _frame(rate=16_000)), sample_rate=24_000
-            )
-        ]

@@ -84,17 +84,20 @@ one session; opt out with `spatius.prewarm(proc, prefetch_session_token=False)`.
 
 The plugin discovers `availableEmotions` and `defaultEmotion` from the selected
 avatar's V3 detail API once during `avatar.start()` and retains them for the session.
-No `SPATIUS_EMOTIONS` or manual supported-label list is needed. Use the public Agent
-hooks to select one emotion and strength for each spoken reply, including all of
-its TTS sentence chunks. Tool preambles and subsequent answers can be separate
-replies. No LiveKit framework modifications are required.
+No `SPATIUS_EMOTIONS` or manual supported-label list is needed. Each spoken reply,
+including all of its TTS sentence chunks, carries one emotion and strength. Tool
+preambles and subsequent answers can be separate replies. No LiveKit framework
+modifications are required.
+
+The LLM selects the expression with LiveKit's expressive markup, opening each reply
+with a marker such as `<expr type="expression" label="happy" strength="0.5"/>`.
+Override `tts_node` and add `avatar.expression_instructions` to the prompt:
 
 ```python
 from collections.abc import AsyncIterable, AsyncIterator
 
 from livekit import rtc
 from livekit.agents import Agent, ModelSettings
-from livekit.agents.types import TimedString
 from livekit.plugins import spatius
 
 avatar = spatius.AvatarSession()
@@ -111,39 +114,59 @@ class Assistant(Agent):
     ) -> AsyncIterator[rtc.AudioFrame]:
         return avatar.tts_node(self, text, model_settings)
 
-    def transcription_node(
-        self, text: AsyncIterable[str | TimedString], model_settings: ModelSettings
-    ) -> AsyncIterator[str | TimedString]:
-        return avatar.transcription_node(text)
-
 
 # Discover capabilities before building the agent instructions:
 await avatar.start(session, room=ctx.room)
 await session.start(agent=Assistant(), room=ctx.room)
 ```
 
-The instructions ask the LLM to begin each reply with a control marker such as
-`<avatar-expression emotion="happy" strength="0.5"/>`. The TTS helper removes
-avatar markers before synthesis, and the transcript helper removes them before
-display. Install **both** hooks. Existing LiveKit voice-expression markup remains
-available to the TTS provider; voice delivery and avatar expression are independent.
-Only the leading marker chooses the expression; later markers are removed without
-changing the active request.
+The framework's transcript sinks strip `<expr>` markup, so no transcription hook is
+needed. Without expressive mode the TTS helper strips the markup before synthesis.
+With [expressive mode](https://docs.livekit.io/agents/models/tts/expressive/), the
+markup goes on to the TTS, which lowers it to native voice controls, so one marker
+steers both the voice and the avatar. Pass the instructions to the expressive prompt
+instead of the agent instructions:
 
-Strength must be a finite number from `0` to `1`. Explicit `0` is preserved;
-omitting strength uses the service default of `1`. Omitting emotion uses the
-avatar default. An optional `default_expression=AvatarExpression(...)` overrides
-that policy; a strength-only override retains the discovered default emotion.
-Explicit default labels are validated against the discovered list during startup.
-`avatar.available_emotions`, `avatar.default_emotion`, and
-`avatar.expression_instructions` are available after `avatar.start()`. Metadata
-lookup or validation failures stop startup before audio forwarding begins.
-Manually selected unsupported labels or invalid strengths raise an error. Missing, malformed, or unsupported LLM selections use
-`default_expression` (or the avatar default when unset). Parsing waits at most
-0.5 seconds for a partial prefix and accepts markers up to 1024 characters. An
-unclosed malformed tag is discarded until `>`, a newline, or 1024 discarded
-characters, then text resumes. This recovery cannot distinguish remaining broken
-attributes from ordinary speech, so use the generated instructions and valid tags.
+```python
+class Assistant(Agent):
+    def __init__(self) -> None:
+        super().__init__(
+            instructions="You are a helpful assistant.",
+            expressive={"tts_instructions_append": avatar.expression_instructions},
+        )
+```
+
+The TTS receives the avatar's label as the voice expression. Providers with a fixed
+vocabulary may not recognize every avatar label (for example `happy_exaggerated`);
+the `strength` attribute steers the avatar only and is ignored by voice lowering.
+
+Only the first expression marker chooses the avatar expression; later markers steer
+the voice (in expressive mode) without changing the active request. Other leading
+markup, such as a sound or a pause, is skipped while looking for it. Parsing is
+lenient:
+
+- `label` matches a discovered emotion ignoring case, with spaces, hyphens, and
+  underscores treated alike. A free-form label selects the earliest discovered
+  emotion it names as a whole word (`"warm, happy"` selects `happy`;
+  `"unhappy"` selects none).
+- `strength` is optional. When it is missing or not a number, the configured
+  default strength applies; numbers outside `0`–`1` are clamped.
+- A marker naming no discovered emotion, or a reply with no marker, uses
+  `default_expression` (or the avatar default when unset).
+
+Parsing waits at most 0.5 seconds for a partial prefix and accepts markers up to
+1024 characters. A tag left unclosed at a newline or past that limit is treated as
+text.
+
+Explicit `0` strength is preserved; omitting strength uses the service default of
+`1`. Omitting emotion uses the avatar default. An optional
+`default_expression=AvatarExpression(...)` overrides that policy; a strength-only
+override retains the discovered default emotion. Explicit default labels are
+validated against the discovered list during startup. `avatar.available_emotions`,
+`avatar.default_emotion`, and `avatar.expression_instructions` are available after
+`avatar.start()`. Metadata lookup or validation failures stop startup before audio
+forwarding begins. Manually selected unsupported labels or invalid strengths raise
+an error.
 
 For scripted audio, select the expression on the audio stream itself:
 
@@ -157,14 +180,18 @@ await session.say(
 )
 ```
 
-`expression_audio` accepts mono PCM frames, uses a continuous resampler to match
-the avatar session's rate, and retains one immutable selection for that invocation.
-It can also wrap a public `realtime_audio_output_node` implementation for manual
-selection. Realtime speech-to-speech models do not automatically emit the text
-control marker. To override the LLM selection for a TTS reply, pass `expression=`
-to `avatar.tts_node(...)` instead. Audio with no annotation uses the configured
-defaults. These APIs do not store a session-wide “next emotion,” so speculative
-or overlapping generations cannot change each other's selection.
+`expression_audio` retains one immutable selection for that invocation. It can also
+wrap a public `realtime_audio_output_node` implementation for manual selection.
+Realtime speech-to-speech models do not automatically emit the text marker. To
+override the LLM selection for a TTS reply, pass `expression=` to
+`avatar.tts_node(...)` instead. Audio with no annotation uses the configured
+defaults. These APIs do not store a session-wide "next emotion," so speculative or
+overlapping generations cannot change each other's selection.
+
+The avatar's audio output accepts mono PCM at any rate and resamples it continuously
+to the session rate, flushing the resampler tail at the end of each reply. It
+resamples itself because the framework's resampler drops the frame metadata that
+carries each reply's expression.
 
 On normal interruption, replacement audio waits for the worker's acknowledgement.
 If that acknowledgement does not arrive within two seconds, pending playback is

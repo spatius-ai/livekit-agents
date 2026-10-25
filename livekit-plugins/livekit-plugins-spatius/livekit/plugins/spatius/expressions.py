@@ -1,18 +1,31 @@
+"""Avatar expression selection from LiveKit's expressive markup.
+
+The LLM opens a reply with ``<expr type="expression" label="happy" strength="0.5"/>``,
+the same marker LiveKit's expressive mode teaches for voice delivery. The first
+expression marker selects the avatar's emotion and strength for the whole reply, since
+a V3 request carries one selection. ``strength`` is optional; the framework's markup
+lowering and transcript stripping ignore it.
+
+With expressive mode active the markup goes on to the TTS, which lowers it to native
+voice controls, so one marker steers both voice and avatar. Otherwise it is stripped
+before synthesis so the TTS does not read it aloud. Transcripts need no extra hook:
+the framework's transcript sinks strip ``<expr>`` markup either way.
+"""
+
 from __future__ import annotations
 
 import asyncio
 import contextlib
 import json
 import math
+import re
 import uuid
-import xml.etree.ElementTree as ET
 from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
 from livekit import rtc
 from livekit.agents import Agent
-from livekit.agents.types import USERDATA_TIMED_TRANSCRIPT, TimedString
 from livekit.agents.voice.agent import ModelSettings
 
 from .log import logger
@@ -20,8 +33,14 @@ from .log import logger
 _EXPRESSION_USERDATA_KEY = "spatius.avatar_expression"
 _PREFIX_TIMEOUT_SECONDS = 0.5
 _MAX_PREFIX_CHARS = 1024
-_OPEN_TAG = "<avatar-expression"
-_CLOSE_TAG = "</avatar-expression"
+
+# the framework's expr grammar (livekit.agents.tts._provider_format): opening,
+# self-closing, or closing; ``attrs`` is None for a closing tag
+_EXPR_TAG_RE = re.compile(r"<expr\b(?P<attrs>[^>]*?)/?\s*>|</expr\s*>")
+# an expr tag cut off by the end of the text, which the next chunk may complete
+_EXPR_PARTIAL_RE = re.compile(rf"</?(?:e|ex|exp|expr(?:\W[^>\n]{{0,{_MAX_PREFIX_CHARS}}})?)?\Z")
+_EXPR_ATTR_RE = re.compile(r"""([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
+_LABEL_SEPARATOR_RE = re.compile(r"[\s_-]+")
 
 
 @dataclass(frozen=True)
@@ -68,7 +87,12 @@ class ExpressionController:
             if not isinstance(label, str):
                 raise TypeError("supported_emotions must contain string labels")
             AvatarExpression(emotion=label)
+        # keep the service's order: it is the order the instructions offer the labels in
+        self._labels = labels
         self._supported_emotions = frozenset(labels)
+        self._labels_by_key: dict[str, str] = {}
+        for label in labels:
+            self._labels_by_key.setdefault(_label_key(label), label)
         self._default_expression = self.validate(
             default_expression if default_expression is not None else AvatarExpression()
         )
@@ -86,17 +110,40 @@ class ExpressionController:
 
     @property
     def instructions(self) -> str:
-        if not self._supported_emotions:
+        """Prompt text teaching the leading expression marker.
+
+        It has no braces, so it is also safe as an expressive ``tts_instructions_append``.
+        """
+        if not self._labels:
             return ""
         return (
-            "Begin each spoken reply with exactly one control marker: "
-            '<avatar-expression emotion="LABEL" strength="NUMBER"/>. '
-            "Choose LABEL from "
-            + json.dumps(sorted(self._supported_emotions))
-            + ". Choose NUMBER from 0 to 1 for the avatar expression's intensity. "
-            "Keep that selection for the entire reply. The marker is removed before speech "
-            "and display. Other voice delivery markers may follow it."
+            "Your avatar's face follows an expression marker at the start of each spoken "
+            'reply: <expr type="expression" label="LABEL" strength="NUMBER"/>. Choose LABEL '
+            "from " + json.dumps(list(self._labels)) + ". strength is optional: a number "
+            "from 0 to 1 for how strongly the face shows it. The face holds the first "
+            "expression marker for the whole reply; later expression markers do not "
+            "change it."
         )
+
+    def match_emotion(self, label: str) -> str | None:
+        """The supported emotion an expression ``label`` names, if any.
+
+        An exact match wins, ignoring case and treating spaces, hyphens, and underscores
+        alike. Otherwise the earliest supported label that appears as a whole word, the
+        longest at the same position: "warm, happy" is happy, "unhappy" names none.
+        """
+        key = _label_key(label)
+        if not key:
+            return None
+        if key in self._labels_by_key:
+            return self._labels_by_key[key]
+        best: tuple[int, int, str] | None = None
+        for candidate, original in self._labels_by_key.items():
+            match = re.search(rf"(?<![^\W_]){re.escape(candidate)}(?![^\W_])", key)
+            if match is not None:
+                ranked = (match.start(), -len(candidate), original)
+                best = ranked if best is None else min(best, ranked)
+        return best[2] if best is not None else None
 
     async def tts_node(
         self,
@@ -104,119 +151,65 @@ class ExpressionController:
         text: AsyncIterable[str],
         model_settings: ModelSettings,
         *,
-        sample_rate: int,
         expression: AvatarExpression | None = None,
     ) -> AsyncGenerator[rtc.AudioFrame, None]:
         reader = _TextReader(text)
         try:
+            # expressive mode lowers expr markup in the TTS, so the marker also steers the
+            # voice; without it the TTS would read the markup aloud
+            forward_markup = agent._get_activity_or_raise()._resolve_expressive_options()
             if expression is None:
                 selected, prefix = await self._select_prefix(reader)
             else:
                 selected, prefix = self.validate(expression), ""
 
-            async def cleaned_text() -> AsyncGenerator[str, None]:
-                stripper = _DirectiveStripper()
-                for value in stripper.feed(prefix):
-                    yield str(value)
+            async def spoken_text() -> AsyncGenerator[str, None]:
+                stripper = None if forward_markup is not None else _MarkupStripper()
+                chunk = prefix
                 while True:
+                    out = stripper.push(chunk) if stripper is not None else chunk
+                    if out:
+                        yield out
                     try:
                         chunk = await reader.read()
                     except StopAsyncIteration:
                         break
-                    for value in stripper.feed(chunk):
-                        yield str(value)
-                for value in stripper.finish():
-                    yield str(value)
+                if stripper is not None and (out := stripper.flush()):
+                    yield out
 
-            async with contextlib.aclosing(cleaned_text()) as clean:
-                audio = Agent.default.tts_node(agent, clean, model_settings)
+            async with contextlib.aclosing(spoken_text()) as spoken:
+                audio = Agent.default.tts_node(agent, spoken, model_settings)
                 async with contextlib.aclosing(
-                    self.expression_audio(audio, sample_rate=sample_rate, expression=selected)
+                    self.expression_audio(audio, expression=selected)
                 ) as output:
                     async for frame in output:
                         yield frame
         finally:
             await reader.aclose()
 
-    async def transcription_node(
-        self, text: AsyncIterable[str | TimedString]
-    ) -> AsyncIterator[str | TimedString]:
-        stripper = _DirectiveStripper()
-        iterator = text.__aiter__()
-        try:
-            async for chunk in iterator:
-                for value in stripper.feed(chunk):
-                    yield value
-            for value in stripper.finish():
-                yield value
-        finally:
-            await _close_iterator(iterator)
-
     async def expression_audio(
         self,
         audio: AsyncIterable[rtc.AudioFrame],
         *,
-        sample_rate: int,
         expression: AvatarExpression | None = None,
     ) -> AsyncGenerator[rtc.AudioFrame, None]:
-        if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or sample_rate <= 0:
-            raise ValueError("sample_rate must be a positive integer")
         selected = self.validate(expression) if expression is not None else self._default_expression
         metadata = _ExpressionMetadata(uuid.uuid4().hex, selected)
         iterator = audio.__aiter__()
-        input_rate: int | None = None
-        resampler: rtc.AudioResampler | None = None
-        pending_userdata: dict[str, Any] = {}
         try:
             async for frame in iterator:
-                if frame.num_channels != 1:
-                    raise ValueError("avatar expression audio must be mono")
-                if frame.sample_rate <= 0:
-                    raise ValueError("audio sample rate must be positive")
-                if input_rate is None:
-                    input_rate = frame.sample_rate
-                    if input_rate != sample_rate:
-                        logger.debug(
-                            "resampling avatar audio from %s to %s", input_rate, sample_rate
-                        )
-                        resampler = rtc.AudioResampler(input_rate, sample_rate, num_channels=1)
-                elif frame.sample_rate != input_rate:
-                    raise ValueError("audio sample rate must remain constant within a reply")
-
-                if resampler is None:
-                    if frame.samples_per_channel:
-                        yield _with_metadata(frame, frame.userdata, metadata)
-                    continue
-
-                _merge_userdata(pending_userdata, frame.userdata)
-                for output in resampler.push(frame):
-                    yield _with_metadata(output, pending_userdata, metadata)
-                    pending_userdata.clear()
-
-            if resampler is not None:
-                for output in resampler.flush():
-                    yield _with_metadata(output, pending_userdata, metadata)
-                    pending_userdata.clear()
+                if frame.samples_per_channel:
+                    yield _with_metadata(frame, metadata)
         finally:
             await _close_iterator(iterator)
 
     async def _select_prefix(self, reader: _TextReader) -> tuple[AvatarExpression, str]:
         prefix = ""
         deadline: float | None = None
+        attrs: dict[str, str] | None = None
         while True:
-            candidate = prefix.lstrip()
-            lowered = candidate.lower()
-            if candidate:
-                if lowered.startswith(_OPEN_TAG):
-                    end = candidate.find(">")
-                    if end >= 0:
-                        try:
-                            return self._parse_marker(candidate[: end + 1]), prefix
-                        except (ET.ParseError, TypeError, ValueError):
-                            break
-                elif not _OPEN_TAG.startswith(lowered):
-                    break
-            if len(prefix) >= _MAX_PREFIX_CHARS:
+            complete, attrs = _leading_expression(prefix)
+            if complete or len(prefix) >= _MAX_PREFIX_CHARS:
                 break
             remaining = None
             if deadline is not None:
@@ -225,30 +218,105 @@ class ExpressionController:
                     break
             try:
                 chunk = await reader.read(timeout=remaining)
-                if chunk and deadline is None:
-                    deadline = asyncio.get_running_loop().time() + _PREFIX_TIMEOUT_SECONDS
-                prefix += chunk
             except (TimeoutError, StopAsyncIteration):
                 break
+            if chunk and deadline is None:
+                deadline = asyncio.get_running_loop().time() + _PREFIX_TIMEOUT_SECONDS
+            prefix += chunk
 
-        if self._supported_emotions or prefix.lstrip().lower().startswith("<avatar"):
-            logger.warning("avatar expression selection unavailable; using configured defaults")
+        if attrs is not None and (selected := self._resolve(attrs)) is not None:
+            return selected, prefix
+        if self._labels:
+            if attrs is not None:
+                logger.warning(
+                    "avatar expression marker names no supported emotion; using defaults"
+                )
+            else:
+                logger.warning("reply has no leading avatar expression marker; using defaults")
         return self._default_expression, prefix
 
-    def _parse_marker(self, marker: str) -> AvatarExpression:
-        if (
-            len(marker) > _MAX_PREFIX_CHARS
-            or not marker.rstrip().endswith("/>")
-            or "\r" in marker
-            or "\n" in marker
-        ):
-            raise ValueError("invalid avatar expression marker")
-        element = ET.fromstring(marker)
-        if element.tag != "avatar-expression" or set(element.attrib) != {"emotion", "strength"}:
-            raise ValueError("invalid avatar expression marker")
-        return self.validate(
-            AvatarExpression(element.attrib["emotion"], float(element.attrib["strength"]))
-        )
+    def _resolve(self, attrs: dict[str, str]) -> AvatarExpression | None:
+        emotion = self.match_emotion(attrs.get("label", ""))
+        if emotion is None:
+            return None
+        return AvatarExpression(emotion, self._parse_strength(attrs.get("strength")))
+
+    def _parse_strength(self, value: str | None) -> float | None:
+        # a missing or unreadable strength keeps the configured one; an out-of-range
+        # number is clamped rather than throwing away the emotion it came with
+        default = self._default_expression.strength
+        if value is None:
+            return default
+        try:
+            number = float(value)
+        except ValueError:
+            return default
+        if not math.isfinite(number):
+            return default
+        return min(1.0, max(0.0, number))
+
+
+def _label_key(label: str) -> str:
+    return _LABEL_SEPARATOR_RE.sub("_", label.strip().lower())
+
+
+def _leading_expression(text: str) -> tuple[bool, dict[str, str] | None]:
+    """Find the expression marker heading ``text``, skipping other leading expr markup.
+
+    Returns whether the search is complete and the marker's attributes, if one was
+    found. It is incomplete while ``text`` is only whitespace and markup, or ends in
+    a cut-off tag; complete once spoken text begins or an expression marker is found.
+    """
+    pos = 0
+    while True:
+        while pos < len(text) and text[pos].isspace():
+            pos += 1
+        if pos == len(text):
+            return False, None
+        if (match := _EXPR_TAG_RE.match(text, pos)) is not None:
+            if (raw := match.group("attrs")) is not None:
+                attrs = {
+                    name.lower(): double or single
+                    for name, double, single in _EXPR_ATTR_RE.findall(raw)
+                }
+                if attrs.get("type", "expression").strip().lower() == "expression":
+                    return True, attrs
+            pos = match.end()
+            continue
+        if _EXPR_PARTIAL_RE.match(text, pos):
+            return False, None
+        return True, None
+
+
+class _MarkupStripper:
+    """Removes expr markup from streamed text, holding back a tag split across chunks."""
+
+    def __init__(self) -> None:
+        self._buf = ""
+
+    def push(self, text: str) -> str:
+        self._buf += text
+        return self._consume(final=False)
+
+    def flush(self) -> str:
+        return self._consume(final=True)
+
+    def _consume(self, *, final: bool) -> str:
+        buf, pos = self._buf, 0
+        out: list[str] = []
+        while (start := buf.find("<", pos)) != -1:
+            out.append(buf[pos:start])
+            if (match := _EXPR_TAG_RE.match(buf, start)) is not None:
+                pos = match.end()
+            elif not final and _EXPR_PARTIAL_RE.match(buf, start):
+                self._buf = buf[start:]
+                return "".join(out)
+            else:
+                out.append("<")  # not markup after all
+                pos = start + 1
+        out.append(buf[pos:])
+        self._buf = ""
+        return "".join(out)
 
 
 class _TextReader:
@@ -278,87 +346,14 @@ class _TextReader:
         await _close_iterator(self._iterator)
 
 
-class _DirectiveStripper:
-    def __init__(self) -> None:
-        self._candidate: list[tuple[str | TimedString, str]] = []
-        self._discarding = False
-        self._discarded_chars = 0
-
-    def feed(self, text: str | TimedString) -> list[str | TimedString]:
-        output: list[tuple[str | TimedString, list[str]]] = []
-
-        def emit(source: str | TimedString, value: str) -> None:
-            if output and output[-1][0] is source:
-                output[-1][1].append(value)
-            else:
-                output.append((source, [value]))
-
-        for char in text:
-            if self._discarding:
-                self._discarded_chars += 1
-                if char == ">":
-                    self._discarding = False
-                elif char in "\r\n" or self._discarded_chars >= _MAX_PREFIX_CHARS:
-                    self._discarding = False
-                    logger.warning(
-                        "avatar expression marker exceeded parsing bounds; resuming text"
-                    )
-                    if char in "\r\n":
-                        emit(text, char)
-                continue
-            if not self._candidate and char != "<":
-                emit(text, char)
-                continue
-            self._candidate.append((text, char))
-            value = "".join(part for _, part in self._candidate).lower()
-            if value in (_OPEN_TAG, _CLOSE_TAG):
-                self._candidate.clear()
-                self._discarding = True
-                self._discarded_chars = len(value)
-            elif not (_OPEN_TAG.startswith(value) or _CLOSE_TAG.startswith(value)):
-                pending = self._candidate
-                self._candidate = []
-                if char == "<":
-                    self._candidate.append(pending.pop())
-                for source, part in pending:
-                    emit(source, part)
-        return [_replace_text(source, "".join(parts)) for source, parts in output]
-
-    def finish(self) -> list[str | TimedString]:
-        value = "".join(part for _, part in self._candidate).lower()
-        output = []
-        if not (value.startswith("<avatar") or value.startswith("</avatar")):
-            for source, char in self._candidate:
-                output.append(_replace_text(source, char))
-        self._candidate.clear()
-        return output
-
-
-def _replace_text(source: str | TimedString, text: str) -> str | TimedString:
-    if isinstance(source, TimedString):
-        replaced = TimedString(text)
-        replaced.__dict__.update(source.__dict__)
-        return replaced
-    return text
-
-
-def _merge_userdata(target: dict[str, Any], source: dict[str, Any]) -> None:
-    for key, value in source.items():
-        if key == USERDATA_TIMED_TRANSCRIPT:
-            target.setdefault(key, []).extend(value)
-        elif key != _EXPRESSION_USERDATA_KEY:
-            target[key] = value
-
-
-def _with_metadata(
-    frame: rtc.AudioFrame, userdata: dict[str, Any], metadata: _ExpressionMetadata
-) -> rtc.AudioFrame:
+def _with_metadata(frame: rtc.AudioFrame, metadata: _ExpressionMetadata) -> rtc.AudioFrame:
+    # a new frame, so a caller's reusable frame never carries a reply's selection
     return rtc.AudioFrame(
         frame.data,
         frame.sample_rate,
         frame.num_channels,
         frame.samples_per_channel,
-        userdata={**userdata, _EXPRESSION_USERDATA_KEY: metadata},
+        userdata={**frame.userdata, _EXPRESSION_USERDATA_KEY: metadata},
     )
 
 

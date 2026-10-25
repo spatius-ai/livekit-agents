@@ -32,7 +32,6 @@ from livekit.agents import (
     get_job_context,
     utils,
 )
-from livekit.agents.types import TimedString
 from livekit.agents.voice.avatar import (
     AudioSegmentEnd,
     AvatarSession as BaseAvatarSession,
@@ -205,10 +204,9 @@ class AvatarSession(BaseAvatarSession):
             raise SpatiusException("start the avatar session before reading its emotion metadata")
         return self._avatar_detail
 
-    def _expression_sample_rate(self) -> int:
-        if self._audio is None or self._audio.sample_rate is None:
+    def _require_started(self) -> None:
+        if self._audio is None:
             raise SpatiusException("start the avatar session before generating expression audio")
-        return self._audio.sample_rate
 
     def tts_node(
         self,
@@ -218,20 +216,15 @@ class AvatarSession(BaseAvatarSession):
         *,
         expression: AvatarExpression | None = None,
     ) -> AsyncIterator[rtc.AudioFrame]:
-        """Use from Agent.tts_node to select and retain one expression for the reply."""
-        return self._expressions.tts_node(
-            agent,
-            text,
-            model_settings,
-            sample_rate=self._expression_sample_rate(),
-            expression=expression,
-        )
+        """Use as Agent.tts_node: the reply's leading expression marker selects its expression.
 
-    def transcription_node(
-        self, text: AsyncIterable[str | TimedString]
-    ) -> AsyncIterator[str | TimedString]:
-        """Remove avatar control markers from the displayed transcript."""
-        return self._expressions.transcription_node(text)
+        The marker is ``<expr type="expression" label="..." strength="..."/>``. With
+        expressive mode active the markup also goes to the TTS, which lowers it to voice
+        controls; otherwise it is stripped before synthesis. Pass ``expression`` to
+        select the expression manually instead.
+        """
+        self._require_started()
+        return self._expressions.tts_node(agent, text, model_settings, expression=expression)
 
     def expression_audio(
         self,
@@ -239,12 +232,9 @@ class AvatarSession(BaseAvatarSession):
         *,
         expression: AvatarExpression | None = None,
     ) -> AsyncIterator[rtc.AudioFrame]:
-        """Normalize and annotate one scripted or realtime audio reply."""
-        return self._expressions.expression_audio(
-            audio,
-            sample_rate=self._expression_sample_rate(),
-            expression=expression,
-        )
+        """Annotate one scripted or realtime audio reply with its expression."""
+        self._require_started()
+        return self._expressions.expression_audio(audio, expression=expression)
 
     async def start(
         self,
