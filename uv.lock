@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12.0, <3.15"
 resolution-markers = [
     "python_full_version >= '3.14' and sys_platform == 'win32'",
@@ -110,6 +110,7 @@ members = [
     "livekit-plugins-vakyam",
     "livekit-plugins-xai",
 ]
+default-groups = ["dev", "typing"]
 constraints = [{ name = "onnxruntime", marker = "python_full_version < '3.11'", specifier = "<1.24" }]
 
 [manifest.dependency-groups]
@@ -3692,7 +3693,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "livekit-agents", editable = "livekit-agents" },
-    { name = "spatius", extras = ["opus"], git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=28947df62f07e01403a606aad6dd4df4bd5ae715" },
+    { name = "spatius", extras = ["opus"], git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=7a3df51a2d16fcc15b0ac6c3d284512cd1d720b9" },
 ]
 
 [[package]]
@@ -6181,8 +6182,8 @@ wheels = [
 
 [[package]]
 name = "spatius"
-version = "1.1.2.dev8+g28947df62"
-source = { git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=28947df62f07e01403a606aad6dd4df4bd5ae715#28947df62f07e01403a606aad6dd4df4bd5ae715" }
+version = "1.1.2.dev9+g7a3df51a2"
+source = { git = "https://github.com/spatius-ai/spatius-sdk-python.git?rev=7a3df51a2d16fcc15b0ac6c3d284512cd1d720b9#7a3df51a2d16fcc15b0ac6c3d284512cd1d720b9" }
 dependencies = [
     { name = "aiohttp" },
     { name = "nanoid" },
