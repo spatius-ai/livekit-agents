@@ -20,7 +20,14 @@ import json
 import math
 import re
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterable, AsyncIterator, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterable,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Sequence,
+)
 from dataclasses import dataclass
 from typing import Any
 
@@ -79,6 +86,7 @@ class ExpressionController:
         self,
         supported_emotions: Sequence[str] | None = None,
         default_expression: AvatarExpression | None = None,
+        on_selected: Callable[[_ExpressionMetadata], Awaitable[None]] | None = None,
     ) -> None:
         if isinstance(supported_emotions, str):
             raise TypeError("supported_emotions must be a sequence of labels")
@@ -96,6 +104,8 @@ class ExpressionController:
         self._default_expression = self.validate(
             default_expression if default_expression is not None else AvatarExpression()
         )
+        # called with a reply's selection once tts_node knows it, before synthesis starts
+        self._on_selected = on_selected
 
     def validate(self, expression: AvatarExpression) -> AvatarExpression:
         if not isinstance(expression, AvatarExpression):
@@ -162,6 +172,9 @@ class ExpressionController:
                 selected, prefix = await self._select_prefix(reader)
             else:
                 selected, prefix = self.validate(expression), ""
+            metadata = _ExpressionMetadata(uuid.uuid4().hex, selected)
+            if self._on_selected is not None:
+                await self._on_selected(metadata)
 
             async def spoken_text() -> AsyncGenerator[str, None]:
                 stripper = None if forward_markup is not None else _MarkupStripper()
@@ -179,9 +192,7 @@ class ExpressionController:
 
             async with contextlib.aclosing(spoken_text()) as spoken:
                 audio = Agent.default.tts_node(agent, spoken, model_settings)
-                async with contextlib.aclosing(
-                    self.expression_audio(audio, expression=selected)
-                ) as output:
+                async with contextlib.aclosing(_annotate(audio, metadata)) as output:
                     async for frame in output:
                         yield frame
         finally:
@@ -194,14 +205,11 @@ class ExpressionController:
         expression: AvatarExpression | None = None,
     ) -> AsyncGenerator[rtc.AudioFrame, None]:
         selected = self.validate(expression) if expression is not None else self._default_expression
-        metadata = _ExpressionMetadata(uuid.uuid4().hex, selected)
-        iterator = audio.__aiter__()
-        try:
-            async for frame in iterator:
-                if frame.samples_per_channel:
-                    yield _with_metadata(frame, metadata)
-        finally:
-            await _close_iterator(iterator)
+        async with contextlib.aclosing(
+            _annotate(audio, _ExpressionMetadata(uuid.uuid4().hex, selected))
+        ) as output:
+            async for frame in output:
+                yield frame
 
     async def _select_prefix(self, reader: _TextReader) -> tuple[AvatarExpression, str]:
         prefix = ""
@@ -344,6 +352,18 @@ class _TextReader:
                 await self._pending
             self._pending = None
         await _close_iterator(self._iterator)
+
+
+async def _annotate(
+    audio: AsyncIterable[rtc.AudioFrame], metadata: _ExpressionMetadata
+) -> AsyncGenerator[rtc.AudioFrame, None]:
+    iterator = audio.__aiter__()
+    try:
+        async for frame in iterator:
+            if frame.samples_per_channel:
+                yield _with_metadata(frame, metadata)
+    finally:
+        await _close_iterator(iterator)
 
 
 def _with_metadata(frame: rtc.AudioFrame, metadata: _ExpressionMetadata) -> rtc.AudioFrame:

@@ -7,7 +7,7 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from spatius import AvatarDetail
+from spatius import AvatarDetail, Expression
 
 from livekit import rtc
 from livekit.plugins.spatius import AvatarSession
@@ -19,7 +19,7 @@ pytestmark = pytest.mark.unit
 @asynccontextmanager
 async def _started_avatar() -> AsyncIterator[tuple[Any, MagicMock, asyncio.Event]]:
     sdk = MagicMock()
-    for method in ("init", "start", "close", "interrupt"):
+    for method in ("init", "start", "close", "interrupt", "set_expression"):
         setattr(sdk, method, AsyncMock())
     sdk.get_avatar_detail = AsyncMock(return_value=AvatarDetail(("neutral", "happy"), "neutral"))
     sent_end = asyncio.Event()
@@ -59,7 +59,7 @@ async def _frames(*frames: rtc.AudioFrame) -> AsyncIterator[rtc.AudioFrame]:
         yield frame
 
 
-async def test_expression_is_sent_on_the_first_packet_of_the_reply() -> None:
+async def test_expression_is_set_before_the_reply_audio() -> None:
     async with _started_avatar() as (session, sdk, sent_end):
         frame = rtc.AudioFrame(b"\x01\x00" * 480, 24_000, 1, 480)
         audio = session._audio
@@ -70,10 +70,12 @@ async def test_expression_is_sent_on_the_first_packet_of_the_reply() -> None:
         audio.flush()
         await asyncio.wait_for(sent_end.wait(), timeout=1)
 
-        assert sdk.send_audio.await_args_list == [
-            call(audio=bytes(frame.data), end=False, emotion="happy", strength=0),
-            call(audio=bytes(frame.data), end=False),
-            call(audio=b"", end=True),
+        sent = [c for c in sdk.mock_calls if c[0] in ("set_expression", "send_audio")]
+        assert sent == [
+            call.set_expression([Expression("happy", 0)]),
+            call.send_audio(audio=bytes(frame.data), end=False),
+            call.send_audio(audio=bytes(frame.data), end=False),
+            call.send_audio(audio=b"", end=True),
         ]
 
 

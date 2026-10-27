@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import asyncio
+import enum
 import json
 import math
 import os
@@ -27,8 +28,11 @@ from livekit.agents import (
     NOT_GIVEN,
     Agent,
     AgentSession,
+    ChatMessage,
+    ConversationItemAddedEvent,
     ModelSettings,
     NotGivenOr,
+    UserStateChangedEvent,
     get_job_context,
     utils,
 )
@@ -41,6 +45,7 @@ from spatius import (
     AudioFormat,
     AvatarDetail,
     AvatarSession as SpatiusSDKSession,
+    Expression,
     LiveKitTransportConfig,
     OggOpusEncoderConfig,
     new_avatar_session,
@@ -59,6 +64,8 @@ DEFAULT_OPUS_FRAME_DURATION_MS = 20
 DEFAULT_OPUS_APPLICATION = "audio"
 SUPPORTED_OPUS_SAMPLE_RATES = {8000, 12000, 16000, 24000, 48000}
 DEFAULT_SESSION_TTL = timedelta(hours=1)
+# the service reads an omitted strength as 0; a marker without one means full strength
+DEFAULT_EXPRESSION_STRENGTH = 1.0
 
 _AVATAR_AGENT_IDENTITY = "spatius-avatar-agent"
 _AVATAR_AGENT_NAME = "spatius-avatar-agent"
@@ -73,6 +80,16 @@ class SpatiusException(Exception):
     """Exception raised for Spatius avatar integration errors."""
 
 
+class _TurnPhase(enum.Enum):
+    """Where the current conversation turn stands, as last sent to the service."""
+
+    IDLE = enum.auto()  # no open turn, or the last reply's audio ended
+    LISTENING = enum.auto()  # user_speak_start sent
+    AWAITING_EXPRESSION = enum.auto()  # user_speak_end sent
+    READY = enum.auto()  # set_expression sent, no reply audio yet
+    SPEAKING = enum.auto()  # reply audio sent, its end not yet sent
+
+
 class AvatarSession(BaseAvatarSession):
     """A Spatius avatar session.
 
@@ -80,6 +97,13 @@ class AvatarSession(BaseAvatarSession):
     to Spatius motion server, it joins the LiveKit room to publish synchronized
     avatar audio and motion data. The worker reports playback started and finished
     back to the agent over LiveKit RPC.
+
+    Each turn also tells the avatar when the user speaks and which expression the
+    reply takes. The user's turn starts when they start speaking while the avatar is
+    silent, or when their speech interrupts the avatar, and ends when the agent
+    commits it. A reply's expression is sent as soon as ``tts_node`` reads it, before
+    synthesis, unless the avatar is still speaking; then it goes with the reply's
+    first audio.
 
     By default the ingress region is resolved automatically through the Spatius
     bootstrap API (``region="auto"``). Pass ``region`` or set the ``SPATIUS_REGION``
@@ -163,6 +187,14 @@ class AvatarSession(BaseAvatarSession):
         self._expressions = ExpressionController()
         self._send_lock = asyncio.Lock()
         self._active_expression: _ExpressionMetadata | None = None
+        self._phase = _TurnPhase.IDLE
+        self._user_speaking = False
+        # the user spoke while the avatar was speaking; an interrupt makes it their turn
+        self._user_spoke = False
+        self._start_after_interrupt = False
+        self._user_turn_committed = False
+        self._turn_wake = asyncio.Event()
+        self._turn_atask: asyncio.Task[None] | None = None
         self._interrupt_done = asyncio.Event()
         self._interrupt_done.set()
         self._interrupted_segments = 0
@@ -341,6 +373,7 @@ class AvatarSession(BaseAvatarSession):
                     else detail.default_emotion,
                     strength=default.strength,
                 ),
+                on_selected=self._on_expression_selected,
             )
             await self._spatius_session.start()
             self._avatar_detail = detail
@@ -358,10 +391,15 @@ class AvatarSession(BaseAvatarSession):
                 _RPC_PLAYBACK_FINISHED, self._on_playback_finished_rpc
             )
             agent_session.on("close", self._on_session_close)
+            agent_session.on("user_state_changed", self._on_user_state_changed)
+            agent_session.on("conversation_item_added", self._on_conversation_item_added)
 
             agent_session.output.replace_audio_tail(self._audio)
             self._forward_atask = asyncio.create_task(
                 self._forward_audio(), name="spatius_avatar_audio_forwarder"
+            )
+            self._turn_atask = asyncio.create_task(
+                self._run_turn_events(), name="spatius_avatar_turn_events"
             )
         except asyncio.CancelledError:
             await self.aclose()
@@ -394,25 +432,134 @@ class AvatarSession(BaseAvatarSession):
                         metadata = audio.metadata(item)
                         if audio.is_cancelled(metadata):
                             continue
-                        options: dict[str, Any] = {}
                         if self._active_expression is None:
+                            await self._open_reply_turn(metadata)
                             self._active_expression = metadata
                             self._sent_segments += 1
-                            if metadata.expression.emotion is not None:
-                                options["emotion"] = metadata.expression.emotion
-                            if metadata.expression.strength is not None:
-                                options["strength"] = metadata.expression.strength
                         elif self._active_expression != metadata:
                             raise ValueError("avatar expression changed within an audio request")
-                        await spatius.send_audio(audio=bytes(item.data), end=False, **options)
+                        await spatius.send_audio(audio=bytes(item.data), end=False)
+                        self._phase = _TurnPhase.SPEAKING
                     elif isinstance(item, AudioSegmentEnd) and self._active_expression is not None:
                         await spatius.send_audio(audio=b"", end=True)
                         self._active_expression = None
+                        self._phase = _TurnPhase.IDLE
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("Spatius avatar audio forwarding stopped", exc_info=True)
             self._on_spatius_close()
+
+    async def _on_expression_selected(self, metadata: _ExpressionMetadata) -> None:
+        """Send a reply's expression as soon as tts_node reads it.
+
+        It waits for the reply's first audio instead while the avatar or the user is
+        still speaking: a new turn must not cut off either of them.
+        """
+        async with self._send_lock:
+            if self._closed or self._aclose_atask is not None or self._spatius_session is None:
+                return
+            if (
+                self._avatar_busy()
+                or self._user_speaking
+                or self._phase in (_TurnPhase.READY, _TurnPhase.SPEAKING)
+            ):
+                return
+            try:
+                await self._open_reply_turn(metadata)
+            except Exception:
+                logger.warning("failed to send Spatius avatar expression", exc_info=True)
+                self._on_spatius_close()
+
+    async def _open_reply_turn(self, metadata: _ExpressionMetadata) -> None:
+        """Select the reply's expression, closing the user's turn first. Hold the send lock.
+
+        A turn takes one expression: a reply that replaces one cancelled before its
+        audio keeps the expression already sent.
+        """
+        assert self._spatius_session is not None
+        spatius = self._spatius_session
+        if self._phase in (_TurnPhase.READY, _TurnPhase.SPEAKING):
+            return
+        if self._start_after_interrupt and self._phase is not _TurnPhase.LISTENING:
+            await spatius.user_speak_start()
+            self._phase = _TurnPhase.LISTENING
+        self._start_after_interrupt = False
+        self._user_turn_committed = False
+        self._user_spoke = False
+        if self._phase is _TurnPhase.LISTENING:
+            await spatius.user_speak_end()
+            self._phase = _TurnPhase.AWAITING_EXPRESSION
+        await spatius.set_expression([self._wire_expression(metadata.expression)])
+        self._phase = _TurnPhase.READY
+
+    def _wire_expression(self, expression: AvatarExpression) -> Expression:
+        label = expression.emotion or self._expressions.default_expression.emotion
+        if label is None:
+            raise SpatiusException("the avatar has no default emotion")
+        strength = expression.strength
+        return Expression(
+            label=label,
+            strength=DEFAULT_EXPRESSION_STRENGTH if strength is None else strength,
+        )
+
+    def _avatar_busy(self) -> bool:
+        """The avatar is speaking: reply audio is being sent, played, or interrupted."""
+        return (
+            self._phase is _TurnPhase.SPEAKING
+            or self._sent_segments > 0
+            or not self._interrupt_done.is_set()
+        )
+
+    def _on_user_state_changed(self, ev: UserStateChangedEvent) -> None:
+        speaking = ev.new_state == "speaking"
+        if speaking and not self._user_speaking:
+            self._user_spoke = True
+        self._user_speaking = speaking
+        self._turn_wake.set()
+
+    def _on_conversation_item_added(self, ev: ConversationItemAddedEvent) -> None:
+        if isinstance(ev.item, ChatMessage) and ev.item.role == "user":
+            self._user_turn_committed = True
+            self._turn_wake.set()
+
+    async def _run_turn_events(self) -> None:
+        try:
+            while True:
+                await self._turn_wake.wait()
+                self._turn_wake.clear()
+                async with self._send_lock:
+                    if self._closed or self._aclose_atask is not None:
+                        return
+                    await self._sync_user_turn()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("Spatius avatar turn events stopped", exc_info=True)
+            self._on_spatius_close()
+
+    async def _sync_user_turn(self) -> None:
+        """Send the user's speech boundaries that the avatar can take now. Hold the send lock.
+
+        The user's turn starts only while the avatar is silent, since the service stops
+        the avatar's reply when it starts. Speech the avatar talked over without being
+        interrupted is not a turn.
+        """
+        assert self._spatius_session is not None
+        spatius = self._spatius_session
+        if not self._avatar_busy():
+            if self._phase is not _TurnPhase.LISTENING and (
+                self._user_speaking or self._start_after_interrupt
+            ):
+                await spatius.user_speak_start()
+                self._phase = _TurnPhase.LISTENING
+            self._start_after_interrupt = False
+            self._user_spoke = self._user_speaking
+        if self._user_turn_committed and not self._start_after_interrupt:
+            self._user_turn_committed = False
+            if self._phase is _TurnPhase.LISTENING:
+                await spatius.user_speak_end()
+                self._phase = _TurnPhase.AWAITING_EXPRESSION
 
     def _on_playback_started_rpc(self, data: rtc.RpcInvocationData) -> str:
         if not self._is_avatar_caller(data, "playback-started"):
@@ -463,6 +610,7 @@ class AvatarSession(BaseAvatarSession):
                 self._audio.notify_playback_finished(
                     playback_position=max(0.0, playback_position), interrupted=False
                 )
+                self._turn_wake.set()
             elif interrupted and self._sent_segments:
                 self._sent_segments -= 1
                 self._audio.notify_playback_finished(
@@ -486,6 +634,11 @@ class AvatarSession(BaseAvatarSession):
         return False
 
     def _on_clear_buffer(self) -> None:
+        # the framework interrupted the reply; speech that caused it opens the user's turn
+        # once the avatar has stopped
+        if self._user_speaking or self._user_spoke:
+            self._start_after_interrupt = True
+            self._turn_wake.set()
         if self._audio is None or self._audio._pending_playback_count == 0:
             return
 
@@ -539,6 +692,7 @@ class AvatarSession(BaseAvatarSession):
                     else:
                         req_id = await self._spatius_session.interrupt()
                         self._active_expression = None
+                        self._phase = _TurnPhase.IDLE
                         logger.debug(
                             "interrupted Spatius avatar playback", extra={"request_id": req_id}
                         )
@@ -548,6 +702,7 @@ class AvatarSession(BaseAvatarSession):
                 # releasing replacement audio through the barrier.
                 if epoch == self._audio.epoch:
                     self._sent_segments = 0
+                    self._turn_wake.set()
                     return
         except asyncio.CancelledError:
             raise
@@ -604,6 +759,8 @@ class AvatarSession(BaseAvatarSession):
 
         if self._agent_session is not None:
             self._agent_session.off("close", self._on_session_close)
+            self._agent_session.off("user_state_changed", self._on_user_state_changed)
+            self._agent_session.off("conversation_item_added", self._on_conversation_item_added)
 
         self._cancel_clear_buffer_timeout()
         self._interrupt_done.set()
@@ -613,6 +770,9 @@ class AvatarSession(BaseAvatarSession):
         if self._forward_atask is not None:
             await utils.aio.cancel_and_wait(self._forward_atask)
             self._forward_atask = None
+        if self._turn_atask is not None:
+            await utils.aio.cancel_and_wait(self._turn_atask)
+            self._turn_atask = None
 
         # release any segment still awaiting a playback-finished RPC so that
         # AgentSession.wait_for_playout() cannot hang during teardown
@@ -622,6 +782,7 @@ class AvatarSession(BaseAvatarSession):
             await self._audio.aclose()
             self._audio = None
         self._active_expression = None
+        self._phase = _TurnPhase.IDLE
         self._interrupted_segments = 0
         self._sent_segments = 0
 
