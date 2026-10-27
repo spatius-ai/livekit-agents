@@ -13,7 +13,11 @@ from livekit import rtc
 
 from ... import tokenize, utils
 from ...log import logger
-from ...tts._provider_format import TranscriptMarkupStripper, strip_all_markup
+from ...tts._provider_format import (
+    TranscriptMarkupStripper,
+    drop_unclosed_markup,
+    strip_all_markup,
+)
 from ...types import NOT_GIVEN, NotGivenOr, TimedString
 from ...utils import is_given
 from .. import io
@@ -355,7 +359,8 @@ class _SegmentSynchronizerImpl:
         if self._playback_completed:
             return self._text_data.pushed_text
 
-        return self._text_data.forwarded_text
+        # an interruption can land between the words of a markup tag
+        return drop_unclosed_markup(self._text_data.forwarded_text)
 
     @utils.log_exceptions(logger=logger)
     async def _capture_task(self) -> None:

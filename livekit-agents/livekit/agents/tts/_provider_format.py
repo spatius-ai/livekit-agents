@@ -1397,6 +1397,26 @@ _PROVIDER_MARKUP: dict[str, list[str]] = {
 # Union of every provider's XML tag names — used by the transcript sinks to strip markup
 # without knowing which provider produced it (see :class:`TranscriptMarkupStripper`).
 _ALL_MARKUP_TAGS: list[str] = sorted({tag for tags in _PROVIDER_MARKUP.values() for tag in tags})
+_MARKUP_TAG_NAMES = frozenset({"expr", *(tag.lower() for tag in _ALL_MARKUP_TAGS)})
+_UNCLOSED_TAG_RE = re.compile(r"<\s*/?(?P<name>[A-Za-z][\w:-]*)(?P<attrs>\s[^<>]*)?")
+
+
+def drop_unclosed_markup(text: str) -> str:
+    """Drop a markup tag cut off by the end of *text*, with the space before it.
+
+    An interrupted reply can stop mid-tag (``... <expr type="break"``), and no later
+    chunk will close it. Only a fragment that is still recognizably markup is dropped: a
+    known tag name, with or without attributes, or the start of ``expr`` cut inside its
+    name. Prose such as ``3 < 5`` or ``x <s`` is kept.
+    """
+    start = text.rfind("<")
+    if start == -1 or (match := _UNCLOSED_TAG_RE.fullmatch(text, start)) is None:
+        return text
+    name = match["name"].lower()
+    markup = name in _MARKUP_TAG_NAMES or (
+        match["attrs"] is None and len(name) >= 2 and "expr".startswith(name)
+    )
+    return text[:start].rstrip(" \t") if markup else text
 
 
 def _drop_trailing_separator(clean: str, stripped_any: bool) -> str:
@@ -1445,7 +1465,7 @@ def split_all_markup(
     )
     tags = expr_tags + [{"type": tag, "value": value} for tag, value in raw_tags]
     if at_text_end:
-        clean = _drop_trailing_separator(clean, bool(tags))
+        clean = _drop_trailing_separator(drop_unclosed_markup(clean), bool(tags))
     return clean, tags
 
 
@@ -1524,7 +1544,8 @@ class TranscriptMarkupStripper:
         clean, tags = split_all_markup(text, at_line_start=self._line_start, at_text_end=False)
         self._tags.extend(tags)
         if final:
-            clean = _drop_trailing_separator(clean, bool(self._tags))
+            # a segment that ends inside a tag (an interrupted reply) never closes it
+            clean = _drop_trailing_separator(drop_unclosed_markup(clean), bool(self._tags))
 
         held = "" if final else clean[len(clean.rstrip(" \t")) :]
         self._buf = held
