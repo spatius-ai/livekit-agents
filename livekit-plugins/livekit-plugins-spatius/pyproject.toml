@@ -23,7 +23,7 @@ classifiers = [
 ]
 dependencies = [
     "livekit-agents>=1.8.9",
-    "spatius[opus] @ git+https://github.com/spatius-ai/spatius-sdk-python.git@731ecf164fe9f2dfd09825998c0624eeb9a001d8",
+    "spatius[opus] @ git+https://github.com/spatius-ai/spatius-sdk-python.git@7a3df51a2d16fcc15b0ac6c3d284512cd1d720b9",
 ]
 
 [project.urls]

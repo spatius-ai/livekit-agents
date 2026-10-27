@@ -8,13 +8,21 @@ from typing import Any
 from unittest.mock import AsyncMock, MagicMock, call, patch
 
 import pytest
-from spatius import AudioFormat, LiveKitTransportConfig, new_avatar_session
+from spatius import (
+    AudioFormat,
+    AvatarDetail,
+    Expression,
+    LiveKitTransportConfig,
+    new_avatar_session,
+)
 from spatius.proto.generated import message_pb2
 
 from livekit import api, rtc
+from livekit.agents import ChatMessage, ConversationItemAddedEvent, UserStateChangedEvent
 from livekit.agents.voice.room_io import ATTRIBUTE_PUBLISH_ON_BEHALF
 from livekit.plugins.spatius import AvatarSession
 from livekit.plugins.spatius.avatar import SpatiusException
+from livekit.plugins.spatius.expressions import AvatarExpression, _ExpressionMetadata
 
 pytestmark = pytest.mark.unit
 
@@ -34,10 +42,24 @@ def _session(**kwargs: Any) -> AvatarSession:
 
 
 @asynccontextmanager
-async def _started_avatar(**kwargs: Any) -> AsyncIterator[tuple[Any, ...]]:
+async def _started_avatar(
+    *, avatar_detail: AvatarDetail | None = None, **kwargs: Any
+) -> AsyncIterator[tuple[Any, ...]]:
     sdk_session = MagicMock()
-    for method in ("init", "start", "close", "send_audio", "interrupt"):
+    for method in (
+        "init",
+        "start",
+        "close",
+        "send_audio",
+        "interrupt",
+        "user_speak_start",
+        "user_speak_end",
+        "set_expression",
+    ):
         setattr(sdk_session, method, AsyncMock())
+    sdk_session.get_avatar_detail = AsyncMock(
+        return_value=avatar_detail or AvatarDetail(("neutral", "happy", "sad"), "neutral")
+    )
     room = MagicMock()
     room.name = "test-room"
     room.local_participant.identity = "test-agent"
@@ -111,6 +133,7 @@ async def test_start_serializes_v3_transport_with_token_auth() -> None:
         assert kwargs["ogg_opus_encoder"].application == "audio"
         assert kwargs["bitrate"] == 32_000
         sdk_session.init.assert_awaited_once()
+        sdk_session.get_avatar_detail.assert_awaited_once()
         sdk_session.start.assert_awaited_once()
         agent_session.output.replace_audio_tail.assert_called_once_with(session._audio)
         assert {
@@ -161,7 +184,7 @@ async def test_audio_frames_and_end_are_forwarded_as_one_request() -> None:
     async with _started_avatar() as (session, sdk_session, *_):
         end_sent = asyncio.Event()
 
-        async def send_audio(*, audio: bytes, end: bool) -> None:
+        async def send_audio(*, audio: bytes, end: bool, **options: Any) -> None:
             if end:
                 end_sent.set()
 
@@ -173,15 +196,138 @@ async def test_audio_frames_and_end_are_forwarded_as_one_request() -> None:
         session._audio.flush()
         await asyncio.wait_for(end_sent.wait(), timeout=1.0)
 
-        assert sdk_session.send_audio.await_args_list == [
-            call(audio=bytes(frame.data), end=False),
-            call(audio=bytes(frame.data), end=False),
-            call(audio=b"", end=True),
+        # unannotated audio takes the avatar's default emotion at full strength
+        sent = [c for c in sdk_session.mock_calls if c[0] in ("set_expression", "send_audio")]
+        assert sent == [
+            call.set_expression([Expression("neutral", 1.0)]),
+            call.send_audio(audio=bytes(frame.data), end=False),
+            call.send_audio(audio=bytes(frame.data), end=False),
+            call.send_audio(audio=b"", end=True),
         ]
 
 
+def _user_state(session: AvatarSession, state: str) -> None:
+    old = "listening" if state == "speaking" else "speaking"
+    session._on_user_state_changed(UserStateChangedEvent(old_state=old, new_state=state))
+
+
+def _turn_events(sdk_session: MagicMock) -> list[str]:
+    names = ("user_speak_start", "user_speak_end", "set_expression", "send_audio", "interrupt")
+    return [name for name, *_ in sdk_session.mock_calls if name in names]
+
+
+async def _settle() -> None:
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+async def test_user_turn_precedes_the_reply_expression() -> None:
+    async with _started_avatar() as (session, sdk_session, *_):
+        end_sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **kwargs: kwargs["end"] and end_sent.set()
+        assert session._audio is not None
+        _user_state(session, "speaking")
+        await _settle()
+        _user_state(session, "listening")
+        await _settle()
+        # the turn ends with the speech, ahead of the commit
+        assert _turn_events(sdk_session) == ["user_speak_start", "user_speak_end"]
+        session._on_conversation_item_added(
+            ConversationItemAddedEvent(item=ChatMessage(role="user", content=["hi"]))
+        )
+        await _settle()
+        await session._audio.capture_frame(_frame())
+        session._audio.flush()
+        await asyncio.wait_for(end_sent.wait(), timeout=1.0)
+
+        assert _turn_events(sdk_session) == [
+            "user_speak_start",
+            "user_speak_end",
+            "set_expression",
+            "send_audio",
+            "send_audio",
+        ]
+
+
+async def test_speaking_again_before_the_reply_starts_a_new_turn() -> None:
+    async with _started_avatar() as (session, sdk_session, *_):
+        for state in ("speaking", "listening", "speaking", "listening"):
+            _user_state(session, state)
+            await _settle()
+        session._on_conversation_item_added(
+            ConversationItemAddedEvent(item=ChatMessage(role="user", content=["hi"]))
+        )
+        await _settle()
+
+        assert _turn_events(sdk_session) == [
+            "user_speak_start",
+            "user_speak_end",
+            "user_speak_start",
+            "user_speak_end",
+        ]
+
+
+async def test_user_turn_starts_only_after_the_interrupted_reply_stops() -> None:
+    async with _started_avatar() as (session, sdk_session, *_):
+        sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **_: sent.set()
+        assert session._audio is not None
+        audio = session._audio
+        await audio.capture_frame(_frame())
+        await asyncio.wait_for(sent.wait(), timeout=1)
+        _user_state(session, "speaking")
+        await _settle()
+        assert "user_speak_start" not in _turn_events(sdk_session)
+
+        audio.clear_buffer()
+        assert session._interrupt_atask is not None
+        await _settle()
+        assert session._on_playback_finished_rpc(
+            _rpc(session.avatar_identity, '{"playback_position": 0, "interrupted": true}')
+        )
+        await asyncio.wait_for(session._interrupt_atask, timeout=1.0)
+        await _settle()
+
+        assert _turn_events(sdk_session) == [
+            "set_expression",
+            "send_audio",
+            "interrupt",
+            "user_speak_start",
+        ]
+
+
+async def test_reply_expression_is_sent_once_before_its_audio() -> None:
+    async with _started_avatar() as (session, sdk_session, *_):
+        end_sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **kwargs: kwargs["end"] and end_sent.set()
+        assert session._audio is not None
+        await session._on_expression_selected(_metadata("happy", 0.4))
+        assert _turn_events(sdk_session) == ["set_expression"]
+        # a replacement reply keeps the expression its turn already has
+        async for frame in session.expression_audio(
+            _frames(_frame()), expression=AvatarExpression("sad")
+        ):
+            await session._audio.capture_frame(frame)
+        session._audio.flush()
+        await asyncio.wait_for(end_sent.wait(), timeout=1.0)
+
+        assert sdk_session.set_expression.await_args_list == [call([Expression("happy", 0.4)])]
+        assert _turn_events(sdk_session) == ["set_expression", "send_audio", "send_audio"]
+
+
+def _metadata(emotion: str, strength: float | None = None) -> _ExpressionMetadata:
+    return _ExpressionMetadata("test-generation", AvatarExpression(emotion, strength))
+
+
+async def _frames(*frames: rtc.AudioFrame) -> AsyncIterator[rtc.AudioFrame]:
+    for frame in frames:
+        yield frame
+
+
 async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
-    async with _started_avatar() as (session, _, *_):
+    async with _started_avatar() as (session, sdk_session, *_):
+        sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **_: sent.set()
         assert session._audio is not None
         audio = session._audio
         started = MagicMock()
@@ -189,6 +335,7 @@ async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
         await audio.capture_frame(_frame())
         audio.flush()
 
+        await asyncio.wait_for(sent.wait(), timeout=1)
         started.assert_not_called()
         assert session._on_playback_started_rpc(_rpc("other-participant")) == "reject"
         assert session._on_playback_started_rpc(_rpc(session.avatar_identity)) == "ok"
@@ -215,14 +362,18 @@ async def test_playback_rpcs_complete_the_matching_output_segment() -> None:
 @pytest.mark.parametrize("confirm_interrupt", [False, True])
 async def test_clear_buffer_interrupts_and_releases_playout(confirm_interrupt: bool) -> None:
     async with _started_avatar() as (session, sdk_session, *_):
+        sent = asyncio.Event()
+        sdk_session.send_audio.side_effect = lambda **_: sent.set()
         assert session._audio is not None
         audio = session._audio
         await audio.capture_frame(_frame())
         audio.flush()
+        await asyncio.wait_for(sent.wait(), timeout=1)
+        interrupted = asyncio.Event()
+        sdk_session.interrupt.side_effect = lambda: interrupted.set()
         audio.clear_buffer()
         assert session._interrupt_atask is not None
-        await session._interrupt_atask
-        sdk_session.interrupt.assert_awaited_once()
+        await asyncio.wait_for(interrupted.wait(), timeout=1)
 
         if confirm_interrupt:
             assert (
@@ -234,6 +385,12 @@ async def test_clear_buffer_interrupts_and_releases_playout(confirm_interrupt: b
         else:
             session._cancel_clear_buffer_timeout()
             session._on_clear_buffer_timeout()
+        if confirm_interrupt:
+            await asyncio.wait_for(session._interrupt_atask, timeout=1.0)
+        else:
+            assert session._aclose_atask is not None
+            await asyncio.wait_for(session._aclose_atask, timeout=1.0)
+        sdk_session.interrupt.assert_awaited_once()
         result = await asyncio.wait_for(audio.wait_for_playout(), timeout=1.0)
         assert result.interrupted is True
         assert audio._pending_playback_count == 0
@@ -254,16 +411,21 @@ async def test_close_releases_pending_playout_and_closes_sdk_once() -> None:
         assert session._forward_atask is None
 
 
-async def test_start_failure_closes_sdk_and_does_not_attach_audio() -> None:
+@pytest.mark.parametrize("phase", ["init", "get_avatar_detail", "start"])
+async def test_start_failure_closes_sdk_and_does_not_attach_audio(phase: str) -> None:
     sdk_session = MagicMock()
     sdk_session.init = AsyncMock()
-    sdk_session.start = AsyncMock(side_effect=RuntimeError("handshake rejected"))
+    sdk_session.start = AsyncMock()
     sdk_session.close = AsyncMock()
+    sdk_session.get_avatar_detail = AsyncMock(
+        return_value=AvatarDetail(("neutral", "happy", "sad"), "neutral")
+    )
     room = MagicMock()
     room.name = "test-room"
     room.local_participant.identity = "test-agent"
     agent_session = MagicMock()
     session = _session()
+    getattr(sdk_session, phase).side_effect = RuntimeError("startup request failed")
 
     with (
         patch("livekit.plugins.spatius.avatar.BaseAvatarSession.start", new=AsyncMock()),
@@ -281,3 +443,11 @@ async def test_start_failure_closes_sdk_and_does_not_attach_audio() -> None:
     sdk_session.close.assert_awaited_once()
     agent_session.output.replace_audio_tail.assert_not_called()
     assert session._closed is True
+
+
+async def test_start_discovers_emotions_once() -> None:
+    detail = AvatarDetail(("calm", "happy"), "calm")
+    async with _started_avatar(avatar_detail=detail) as (avatar, sdk, *_):
+        assert avatar.available_emotions == ("calm", "happy")
+        assert avatar.default_emotion == "calm"
+        sdk.get_avatar_detail.assert_awaited_once()
