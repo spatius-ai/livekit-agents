@@ -100,10 +100,12 @@ class AvatarSession(BaseAvatarSession):
 
     Each turn also tells the avatar when the user speaks and which expression the
     reply takes. The user's turn starts when they start speaking while the avatar is
-    silent, or when their speech interrupts the avatar, and ends when the agent
-    commits it. A reply's expression is sent as soon as ``tts_node`` reads it, before
-    synthesis, unless the avatar is still speaking; then it goes with the reply's
-    first audio.
+    silent, or when their speech interrupts the avatar, and ends when they stop
+    speaking, or else when the agent commits it. Ending at the speech rather than the
+    commit keeps the end ahead of the reply's expression by the endpointing delay,
+    even when preemptive generation has the reply ready at the commit. A reply's
+    expression is sent as soon as ``tts_node`` reads it, before synthesis, unless the
+    avatar is still speaking; then it goes with the reply's first audio.
 
     By default the ingress region is resolved automatically through the Spatius
     bootstrap API (``region="auto"``). Pass ``region`` or set the ``SPATIUS_REGION``
@@ -192,7 +194,8 @@ class AvatarSession(BaseAvatarSession):
         # the user spoke while the avatar was speaking; an interrupt makes it their turn
         self._user_spoke = False
         self._start_after_interrupt = False
-        self._user_turn_committed = False
+        # the user stopped speaking, or the agent committed their turn
+        self._user_turn_ending = False
         self._turn_wake = asyncio.Event()
         self._turn_atask: asyncio.Task[None] | None = None
         self._interrupt_done = asyncio.Event()
@@ -485,7 +488,7 @@ class AvatarSession(BaseAvatarSession):
             await spatius.user_speak_start()
             self._phase = _TurnPhase.LISTENING
         self._start_after_interrupt = False
-        self._user_turn_committed = False
+        self._user_turn_ending = False
         self._user_spoke = False
         if self._phase is _TurnPhase.LISTENING:
             await spatius.user_speak_end()
@@ -513,14 +516,20 @@ class AvatarSession(BaseAvatarSession):
 
     def _on_user_state_changed(self, ev: UserStateChangedEvent) -> None:
         speaking = ev.new_state == "speaking"
-        if speaking and not self._user_speaking:
-            self._user_spoke = True
+        if speaking:
+            if not self._user_speaking:
+                self._user_spoke = True
+            # speaking again before the end went out continues the turn
+            self._user_turn_ending = False
+        elif self._user_speaking:
+            self._user_turn_ending = True
         self._user_speaking = speaking
         self._turn_wake.set()
 
     def _on_conversation_item_added(self, ev: ConversationItemAddedEvent) -> None:
+        # the commit ends a turn whose end of speech was not seen
         if isinstance(ev.item, ChatMessage) and ev.item.role == "user":
-            self._user_turn_committed = True
+            self._user_turn_ending = True
             self._turn_wake.set()
 
     async def _run_turn_events(self) -> None:
@@ -543,7 +552,8 @@ class AvatarSession(BaseAvatarSession):
 
         The user's turn starts only while the avatar is silent, since the service stops
         the avatar's reply when it starts. Speech the avatar talked over without being
-        interrupted is not a turn.
+        interrupted is not a turn. It ends once the user stops speaking; if they speak
+        again before the reply, the next sync starts a new turn.
         """
         assert self._spatius_session is not None
         spatius = self._spatius_session
@@ -555,9 +565,9 @@ class AvatarSession(BaseAvatarSession):
                 self._phase = _TurnPhase.LISTENING
             self._start_after_interrupt = False
             self._user_spoke = self._user_speaking
-        if self._user_turn_committed and not self._start_after_interrupt:
-            self._user_turn_committed = False
-            if self._phase is _TurnPhase.LISTENING:
+        if self._user_turn_ending and not self._start_after_interrupt:
+            self._user_turn_ending = False
+            if self._phase is _TurnPhase.LISTENING and not self._user_speaking:
                 await spatius.user_speak_end()
                 self._phase = _TurnPhase.AWAITING_EXPRESSION
 
