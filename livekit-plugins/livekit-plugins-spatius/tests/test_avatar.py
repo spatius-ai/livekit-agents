@@ -229,6 +229,9 @@ async def test_user_turn_precedes_the_reply_expression() -> None:
         _user_state(session, "speaking")
         await _settle()
         _user_state(session, "listening")
+        await _settle()
+        # the turn ends with the speech, ahead of the commit
+        assert _turn_events(sdk_session) == ["user_speak_start", "user_speak_end"]
         session._on_conversation_item_added(
             ConversationItemAddedEvent(item=ChatMessage(role="user", content=["hi"]))
         )
@@ -243,6 +246,24 @@ async def test_user_turn_precedes_the_reply_expression() -> None:
             "set_expression",
             "send_audio",
             "send_audio",
+        ]
+
+
+async def test_speaking_again_before_the_reply_starts_a_new_turn() -> None:
+    async with _started_avatar() as (session, sdk_session, *_):
+        for state in ("speaking", "listening", "speaking", "listening"):
+            _user_state(session, state)
+            await _settle()
+        session._on_conversation_item_added(
+            ConversationItemAddedEvent(item=ChatMessage(role="user", content=["hi"]))
+        )
+        await _settle()
+
+        assert _turn_events(sdk_session) == [
+            "user_speak_start",
+            "user_speak_end",
+            "user_speak_start",
+            "user_speak_end",
         ]
 
 
