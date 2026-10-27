@@ -284,6 +284,30 @@ def test_transcript_stripper_leaves_untagged_whitespace_alone() -> None:
     assert out == "hello     world"
 
 
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        ["Hello there. ", "<expr ", 'type="break"'],  # cut between the tag's words
+        ["Hello there. ", '<expr type="break" label="5'],
+        ["Hello there. <ex"],  # cut inside the name
+        ["Hello there. ", "<sound"],
+    ],
+)
+def test_transcript_stripper_drops_a_tag_cut_off_at_segment_end(chunks: list[str]) -> None:
+    # an interrupted reply can stop mid-tag; flushing must not publish the fragment
+    stripper = TranscriptMarkupStripper()
+    out = "".join(stripper.push(c) for c in chunks) + stripper.flush()
+    assert out == "Hello there."
+    assert strip_all_markup("".join(chunks)) == "Hello there."
+
+
+@pytest.mark.parametrize("text", ["Is 3 <", "Is 3 < 5", "x <s", "the <e"])
+def test_transcript_stripper_keeps_prose_angle_brackets_at_segment_end(text: str) -> None:
+    stripper = TranscriptMarkupStripper()
+    assert stripper.push(text) + stripper.flush() == text
+    assert strip_all_markup(text) == text
+
+
 def test_expression_attribute_from_expr() -> None:
     _, tags = split_all_markup(JOKE)
     attr = expression_attribute(tags)
