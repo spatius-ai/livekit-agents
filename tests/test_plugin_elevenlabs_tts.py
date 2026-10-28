@@ -1059,3 +1059,81 @@ async def test_dialogue_send_loop_stops_keep_alive_once_context_closes(
 
         connection._input_queue.close()
         await asyncio.wait_for(send_task, timeout=1.0)
+
+
+def test_markup_opts_in_only_for_audio_tag_models() -> None:
+    from livekit.agents import Agent, AgentSession
+    from livekit.agents.voice.agent_activity import AgentActivity
+
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_turbo_v2_5")
+    # older models read tags aloud, so they declare no dialect
+    assert tts.markup.llm_instructions() is None
+
+    # read live, so a model switch changes the next turn's guide
+    tts.update_options(model="eleven_v3_conversational")
+    assert tts.markup._provider_key() == "elevenlabs"
+    instr = tts.markup.llm_instructions()
+    assert instr is not None and 'label="DIRECTION"' in instr
+
+    def resolves(tts_obj: agents_tts.TTS) -> bool:
+        session = AgentSession(expressive=True, tts=tts_obj)
+        return (
+            AgentActivity(Agent(instructions="test"), session)._resolve_expressive_options()
+            is not None
+        )
+
+    # the plugin streams its own input, so only the adapter's lowering path qualifies
+    assert not resolves(tts)
+    assert resolves(agents_tts.StreamAdapter(tts=tts))
+
+
+async def test_stream_adapter_sends_audio_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_v3_conversational")
+    sent: list[str] = []
+
+    class _Silence(agents_tts.ChunkedStream):
+        async def _run(self, output_emitter: agents_tts.AudioEmitter) -> None:
+            sent.append(self._input_text)
+            output_emitter.initialize(
+                request_id="req",
+                sample_rate=tts.sample_rate,
+                num_channels=1,
+                mime_type="audio/pcm",
+            )
+            output_emitter.push(b"\x00\x00" * 240)
+
+    monkeypatch.setattr(
+        tts,
+        "synthesize",
+        lambda text, *, conn_options: _Silence(tts=tts, input_text=text, conn_options=conn_options),
+    )
+    adapter = agents_tts.StreamAdapter(tts=tts)
+    adapter._set_expressive(True)
+    stream = adapter.stream()
+    try:
+        stream.push_text('<expr type="expression" label="excited"/> We did it! ')
+        stream.push_text('<expr type="sound" label="laugh"/> Thank you so much for waiting.')
+        stream.end_input()
+        async for _ in stream:
+            pass
+    finally:
+        await stream.aclose()
+        await adapter.aclose()
+
+    assert " ".join(sent) == "[excited] We did it! [laughs] Thank you so much for waiting."
+
+
+@pytest.mark.parametrize(
+    ("text", "sent"),
+    [
+        ("[laughs]", "[laughs] ..."),
+        ("[sighs] [exhales] ", "[sighs] [exhales] ..."),
+        ("[laughs] Ha!", "[laughs] Ha!"),
+        ("Plain words.", "Plain words."),
+    ],
+)
+def test_dialogue_body_pads_a_tag_only_input(text: str, sent: str) -> None:
+    # text-to-dialogue rejects an input that is empty once its audio tags are removed
+    tts = elevenlabs_tts.TTS(api_key="test-key", model="eleven_v3_conversational")
+    body = elevenlabs_tts._build_dialogue_synthesize_body(tts._opts, text, None)  # pyright: ignore[reportPrivateUsage]
+    assert body["inputs"][0]["text"] == sent

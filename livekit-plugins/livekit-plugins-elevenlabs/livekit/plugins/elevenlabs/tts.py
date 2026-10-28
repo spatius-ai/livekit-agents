@@ -20,6 +20,7 @@ import contextlib
 import dataclasses
 import json
 import os
+import re
 import time
 import weakref
 from dataclasses import dataclass, replace
@@ -96,6 +97,12 @@ API_BASE_URL_V1 = "https://api.elevenlabs.io/v1"
 AUTHORIZATION_HEADER = "xi-api-key"
 WS_INACTIVITY_TIMEOUT = 180
 _DIALOGUE_VOICE_SETTINGS_FIELDS = frozenset({"stability"})
+# a v3 audio tag ([laughs], [excited]); text-to-dialogue rejects an input with nothing
+# left once they are removed
+_AUDIO_TAG_RE = re.compile(r"\[[^\]]*\]")
+# what a tag-only input speaks instead: an ellipsis is accepted and renders as a beat,
+# so a reaction on its own ("...that's hilarious! [laughs]") still plays
+_TAG_ONLY_FILLER = " ..."
 # the text-to-dialogue server finalizes a context idle for 20s; keep-alives reset that
 _DIALOGUE_KEEP_ALIVE_INTERVAL = 10.0
 
@@ -220,6 +227,14 @@ class TTS(tts.TTS):
         self._prewarm_task: asyncio.Task[None] | None = None
         self._opts_revision = 0
         self._warn_if_dialogue_model_ignores_options()
+
+    class Markup(tts.TTS.Markup):
+        # audio tags exist only on the v3+ models, which go through text-to-dialogue; the
+        # older models would read them aloud. Read live, so update_options(model=...)
+        # changes the next turn's guide.
+        def _provider_key(self) -> str:
+            assert isinstance(self._tts, TTS)
+            return "elevenlabs" if is_dialogue_model(self._tts._opts.model) else ""
 
     @property
     def model(self) -> str:
@@ -1419,6 +1434,10 @@ def _build_dialogue_synthesize_body(
 ) -> dict[str, Any]:
     """Single-turn body for /text-to-dialogue/stream: `settings`, not `voice_settings`,
     and voice_id is per-input rather than part of the URL."""
+    if not _AUDIO_TAG_RE.sub("", input_text).strip():
+        # expressive mode sends one sentence per request, so a reaction after the last
+        # sentence arrives alone
+        input_text = input_text.rstrip() + _TAG_ONLY_FILLER
     body: dict[str, Any] = {
         "inputs": [{"text": input_text, "voice_id": opts.voice_id}],
         "model_id": opts.model,

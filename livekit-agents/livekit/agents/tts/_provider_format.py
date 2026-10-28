@@ -13,6 +13,7 @@ Provider docs:
 - xAI: https://docs.x.ai/developers/model-capabilities/audio/voice
 - Fish Audio: https://docs.fish.audio/developer-guide/core-features/emotions
 - Fish Audio: https://docs.fish.audio/features/text-to-speech/drama-3
+- ElevenLabs: https://elevenlabs.io/docs/best-practices/prompting
 """
 
 from __future__ import annotations
@@ -286,6 +287,38 @@ _GEMINI_SOUND_ALIASES = {
 }
 
 
+# ElevenLabs v3 audio tags (eleven_v3*, eleven_v4*), from the v3 prompting guide
+# (https://elevenlabs.io/docs/best-practices/prompting).
+#
+# A tag is free-form text in square brackets that steers the words after it ([excited],
+# [whispers], [sarcastic]), and the same brackets carry vocal reactions ([laughs],
+# [sighs]). v3 has no SSML, so a pause lowers to an ellipsis, the pause the guide
+# documents. There are no paired tags, so wrapping prosody is not taught. The older
+# models read tags aloud, which is why only the v3+ models opt in to this key.
+_ELEVENLABS_SOUNDS = ["laughs", "sighs", "exhales", "gulps"]
+_ELEVENLABS_TAGS = ["expression", "sound", "break"]
+_ELEVENLABS_PAUSE = "..."
+
+# expr labels that differ from the reactions ElevenLabs documents (other providers
+# advertise "laugh"/"sigh", so a hallucinated one still lowers to a sound v3 renders)
+_ELEVENLABS_SOUND_ALIASES = {
+    "laugh": "laughs",
+    "laughing": "laughs",
+    "chuckle": "laughs",
+    "chuckling": "laughs",
+    "giggle": "laughs",
+    "sigh": "sighs",
+    "sighing": "sighs",
+    "exhale": "exhales",
+    "breathe": "exhales",
+    "breath": "exhales",
+    "gulp": "gulps",
+}
+# wrapping prosody labels v3 has a tag for; the tag steers what follows, so a span
+# lowers to a prefix
+_ELEVENLABS_PROSODY = {"whisper": "whispers", "whispering": "whispers"}
+
+
 # --- LiveKit expression markers (expr) ---
 # The LLM emits a single marker tag,
 # <expr type="..." label="..."/>, instead of provider-native tags. The *syntax* is shared,
@@ -294,8 +327,8 @@ _GEMINI_SOUND_ALIASES = {
 # only a discrete emotion vocabulary rather than free-form delivery descriptions, and
 # only some have wrapping prosody. Types (per provider):
 #   expression (self-closing) - delivery/emotion for what follows; free-form for
-#                               Inworld, Cartesia's discrete emotion vocabulary, absent
-#                               for xAI
+#                               Inworld and ElevenLabs, Cartesia's discrete emotion
+#                               vocabulary, absent for xAI
 #   break      (self-closing) - pause, label is a duration ("500ms", "1s"); all providers
 #   sound      (self-closing) - non-verbal vocalization from the provider's own list
 #                               (Inworld: laugh/sigh/..., xAI: chuckle/tsk/...); absent
@@ -303,7 +336,8 @@ _GEMINI_SOUND_ALIASES = {
 #   prosody    (wrapping)     - <expr type="prosody" label="whisper">words</expr>, labels
 #                               from xAI's wrapping-tag list; for Cartesia a self-closing
 #                               point control (slow/fast/soft/loud -> coarse speed/volume
-#                               ratios); absent for Inworld (folded into expression)
+#                               ratios); absent for Inworld and ElevenLabs (folded into
+#                               expression)
 #   spell      (wrapping)     - <expr type="spell">A7X9</expr> character-by-character
 #                               readout; Cartesia only
 # convert_markup lowers expr to each provider's native syntax before synthesis (via the
@@ -893,6 +927,76 @@ delivery label instead.""")
     )
 
 
+_ELEVENLABS_EXAMPLES = [
+    '<expr type="expression" label="warmly"/> Hey, good to hear from you. <expr type="expression" label="curious"/> What\'s on your mind today?',  # noqa: E501
+    '<expr type="expression" label="playful"/> Okay, why did the burger go to the gym? <expr type="expression" label="smug"/> Because it wanted better buns! <expr type="sound" label="laughs"/>',  # noqa: E501
+    '<expr type="expression" label="sympathetic"/> I\'m really sorry, that sounds exhausting. <expr type="sound" label="sighs"/> <expr type="expression" label="reassuring"/> We\'ll get it sorted.',  # noqa: E501
+    # sound-free, so at least one example survives any steering filter
+    '<expr type="expression" label="calm"/> You\'re all set for <expr type="break" label="500ms"/> Thursday the ninth. <expr type="expression" label="slowly and clearly"/> Your code is B 4 J 7.',  # noqa: E501
+    '<expr type="expression" label="whispers"/> Okay, don\'t tell anyone yet. <expr type="expression" label="excited"/> But I think we actually pulled it off!',  # noqa: E501
+]
+
+
+def _elevenlabs_expr_llm_instructions(sounds: list[str]) -> str:
+    sections = [
+        """Delivery - a short direction for how a sentence sounds. Self-closing; place at \
+the START of EVERY sentence.
+   <expr type="expression" label="DIRECTION"/>
+   The label is free-form but SHORT: one to four words naming a feeling or a way of \
+speaking, like a note to a voice actor ("excited", "warmly", "curious", "sarcastic", \
+"whispers", "nervously", "deadpan"). A short adjective or adverb lands more reliably \
+than a long description.
+   Write every direction fresh for THIS moment; the quoted ones only show the shape. \
+Describe the voice, never what the speaker is doing or what the scene looks like.
+   Most moments call for a shade, not the extreme; save the strongest directions for \
+true peaks. A direction covers its own sentence: repeat it to carry a feeling into the \
+next sentence, or write a new one where the feeling shifts. Match its energy to the \
+sentence's punctuation; a calm direction flattens an exclamation.
+   Never put brackets, quotes, or parentheses inside a direction."""
+    ]
+    if sounds:
+        sections.append(
+            f"""Sounds - a non-verbal reaction, placed exactly where it happens. Self-closing.
+   <expr type="sound" label="{sounds[0]}"/>
+   Labels are a fixed vocabulary: {", ".join(sounds)}.
+   {_sound_guidance(sounds)}"""
+        )
+    sections.append(
+        """Pauses - a beat before a key detail. Self-closing.
+   <expr type="break" label="500ms"/>
+   This voice has ONE pause length, so the duration is only a hint. NEVER place a \
+break next to a period, question mark, exclamation point, or ellipsis; sentence \
+punctuation already pauses. Most replies need no break markers at all."""
+    )
+
+    parts = [
+        _EXPR_PREAMBLE,
+        _numbered_sections(sections),
+        "There are no other marker types for this voice: no spell marker and no wrapping "
+        "prosody. Put a whisper or any other way of speaking in the delivery label instead.",
+        "Write for the EAR, not the page: no em or en dashes anywhere in spoken text. Use "
+        "a comma or a period for a short beat. Avoid semicolons, mid-sentence colons, and "
+        "parenthetical asides; rewrite them as separate sentences or commas.",
+        "When the conversation is in another language, still write every marker label in "
+        "English; directions and labels steer the voice and are never translated.",
+    ]
+
+    register = [
+        "At heavy moments keep directions soft, steady, and caring, never bright or "
+        "playful against hard news; bright directions belong to bright moments."
+    ]
+    if "laughs" in sounds:
+        register.append(
+            "Laughter belongs only in genuinely playful or celebratory beats, never at "
+            "a serious moment."
+        )
+    parts.append(" ".join(register))
+
+    if examples := _sound_examples(_ELEVENLABS_EXAMPLES, sounds, _ELEVENLABS_SOUNDS):
+        parts.append("Examples:\n" + "\n".join(f"  {ex}" for ex in examples))
+    return "\n\n".join(parts)
+
+
 # Every provider's full expr sound vocabulary (the advertised labels before any
 # speech_steering filtering). Providers absent here have no non-verbal sounds.
 _PROVIDER_SOUNDS: dict[str, list[str]] = {
@@ -901,6 +1005,7 @@ _PROVIDER_SOUNDS: dict[str, list[str]] = {
     "fishaudio": _FISHAUDIO_SOUNDS,
     "fishaudio_drama": _FISHAUDIO_SOUNDS,
     "gemini": _GEMINI_SOUNDS,
+    "elevenlabs": _ELEVENLABS_SOUNDS,
 }
 
 
@@ -992,6 +1097,15 @@ _NONVERBAL_SOUND_LABELS: dict[str, dict[str, list[str]]] = {
         "mouth_sounds": [],
         "reflex_sounds": ["cough"],
     },
+    "elevenlabs": {
+        "laughing": ["laughs"],
+        "breathing": ["exhales"],
+        "sighing": ["sighs"],
+        "crying": [],
+        "vocalizing": [],
+        "mouth_sounds": ["gulps"],
+        "reflex_sounds": [],
+    },
 }
 
 # NonverbalOptions field -> the provider's wrapping-prosody labels it governs.
@@ -1028,11 +1142,15 @@ def supported_nonverbals(provider: str) -> dict[str, list[str]]:
 _SOUND_USAGE_HINTS: dict[str, str] = {
     "laugh": "a laugh at something obviously funny",
     "laughing": "a laugh at something obviously funny",
+    "laughs": "a laugh at something obviously funny",
     "chuckle": "a chuckle at something subtly humorous",
     "chuckling": "a chuckle at something subtly humorous",
     "giggle": "a chuckle at something subtly humorous",
     "sigh": "a sigh when commiserating",
     "sighing": "a sigh when commiserating",
+    "sighs": "a sigh when commiserating",
+    "exhales": "a slow exhale of relief or before something hard",
+    "gulps": "a gulp when nervous about what comes next",
     "inhale": "a sharp inhale before a big reveal",
     "gasping": "a gasp at a sudden shock or reveal",
     "lip-smack": "a lip-smack or tongue-click as a tiny beat of thought",
@@ -1302,6 +1420,11 @@ def _convert_expr(provider: str, text: str) -> str:
             if span in _FISHAUDIO_DRAMA_SPANS:
                 return f"<{span}>{inner}</{span}>"
             return inner
+        if provider == "elevenlabs":
+            # not taught; salvage a whisper as v3's prefix tag, which steers what follows
+            if tag := _ELEVENLABS_PROSODY.get(label):
+                return f"[{tag}] {inner}"
+            return inner
         return inner
 
     # a marker the provider doesn't support lowers to "" — _dedup_removal_space keeps its
@@ -1319,6 +1442,11 @@ def _convert_expr(provider: str, text: str) -> str:
                 return f'<emotion value="{label}"/>'
             if provider in ("inworld", "fishaudio", "fishaudio_drama"):
                 return f'<expression value="{label}"/>'
+            if provider == "elevenlabs":
+                # a bracket would end the audio tag early, and an avatar-style label
+                # (happy_exaggerated) reads better as words
+                label = re.sub(r"[\[\]_]+", " ", label).strip()
+                return f'<expression value="{label}"/>' if label else ""
             return ""  # xAI has no free-form delivery descriptions
         if marker_type == "sound":
             if provider == "cartesia":
@@ -1327,6 +1455,8 @@ def _convert_expr(provider: str, text: str) -> str:
                 label = _XAI_SOUND_ALIASES.get(label.lower(), label)
             if provider in ("fishaudio", "fishaudio_drama"):
                 label = _FISHAUDIO_SOUND_ALIASES.get(label.lower(), label)
+            if provider == "elevenlabs":
+                label = _ELEVENLABS_SOUND_ALIASES.get(label.lower(), label)
             return f'<sound value="{label}"/>'
         if marker_type == "break":
             return f'<break time="{label}"/>'
@@ -1374,6 +1504,8 @@ def llm_instructions(provider: str, steering: SpeechSteeringOptions | None = Non
         return _fishaudio_expr_llm_instructions(sounds, disfluencies=disfluencies)
     if provider == "gemini":
         return _gemini_expr_llm_instructions(_allowed_sounds(provider, steering))
+    if provider == "elevenlabs":
+        return _elevenlabs_expr_llm_instructions(_allowed_sounds(provider, steering))
     return None
 
 
@@ -1392,6 +1524,8 @@ _PROVIDER_MARKUP: dict[str, list[str]] = {
     # of the request); membership here is what marks it markup-capable for
     # normalize_markup, and what tells convert_markup to leave its markers in place
     "gemini": _GEMINI_TAGS,
+    # like fish, v3's native dialect is square brackets produced only by convert_markup
+    "elevenlabs": _ELEVENLABS_TAGS,
 }
 
 # Union of every provider's XML tag names — used by the transcript sinks to strip markup
@@ -1669,6 +1803,7 @@ _SELF_CLOSING_TAGS: dict[str, list[str]] = {
     "inworld": ["expression", "sound", "break"],
     "fishaudio": ["expression", "sound", "break"],
     "fishaudio_drama": ["expression", "sound", "break"],
+    "elevenlabs": ["expression", "sound", "break"],
 }
 
 
@@ -1716,5 +1851,10 @@ def convert_markup(provider: str, text: str) -> str:
         # spans are already drama-3's native paired tags
         text = convert_expression_tags(text)
         text = _FISHAUDIO_BREAK_RE.sub(_fishaudio_drama_break_to_bracket, text)
+    if provider == "elevenlabs":
+        # directions are free-form, so <expression value="X"/> lowers to [X] verbatim;
+        # v3 has no SSML, so a break lowers to the ellipsis its guide documents
+        text = convert_expression_tags(text)
+        text = _FISHAUDIO_BREAK_RE.sub(_ELEVENLABS_PAUSE, text)
     # <break> is otherwise passed through unchanged: Inworld accepts it as native SSML.
     return text
