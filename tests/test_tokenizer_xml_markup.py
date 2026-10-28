@@ -576,6 +576,94 @@ class TestFishAudioDramaDialect:
         assert 'label="DIRECTION"' in instr
 
 
+class TestElevenLabsDialect:
+    """v3 audio tags are free-form [direction] prefixes, and reactions share the brackets.
+    v3 has no SSML, so a break lowers to an ellipsis, and nothing wraps."""
+
+    def test_llm_instructions_are_free_form(self) -> None:
+        from livekit.agents.tts import _provider_format as pf
+
+        instr = pf.llm_instructions("elevenlabs")
+        assert instr is not None
+        assert '<expr type="expression" label="DIRECTION"/>' in instr
+        assert "REGISTER of the moment" in instr
+        assert ", ".join(pf._ELEVENLABS_SOUNDS) in instr
+        # nothing it can't render is taught
+        assert 'type="prosody"' not in instr and 'type="spell"' not in instr
+
+    def test_convert_expr_to_audio_tags(self) -> None:
+        from livekit.agents.tts import _provider_format as pf
+
+        raw = (
+            '<expr type="expression" label="warmly"/> Hey there. '
+            '<expr type="sound" label="laughs"/> You\'re set for '
+            '<expr type="break" label="500ms"/> Thursday. '
+            '<expr type="expression" label="sympathetic"/> Sorry about that. '
+            '<expr type="sound" label="sigh"/>'
+        )
+        assert pf.convert_markup("elevenlabs", raw) == (
+            "[warmly] Hey there. [laughs] You're set for ... Thursday. "
+            "[sympathetic] Sorry about that. [sighs]"
+        )
+
+    def test_convert_cleans_labels(self) -> None:
+        from livekit.agents.tts import _provider_format as pf
+
+        # an avatar-style label reads as words, and a bracket can't end the tag early
+        raw = '<expr type="expression" label="happy_exaggerated, thrilled"/> Yes!'
+        assert pf.convert_markup("elevenlabs", raw) == "[happy exaggerated, thrilled] Yes!"
+        raw = '<expr type="expression" label="[sly]"/> Sure.'
+        assert pf.convert_markup("elevenlabs", raw) == "[sly] Sure."
+        # nothing left to say drops the marker, like any provider's unsupported one
+        raw = '<expr type="expression" label="[]"/> Sure.'
+        assert pf.convert_markup("elevenlabs", raw).strip() == "Sure."
+
+    def test_untaught_markers_keep_their_words(self) -> None:
+        from livekit.agents.tts import _provider_format as pf
+
+        # a whisper span salvages as v3's prefix tag; anything else drops the marker
+        raw = '<expr type="prosody" label="whisper">psst</expr> okay'
+        assert pf.convert_markup("elevenlabs", raw) == "[whispers] psst okay"
+        raw = (
+            'Say <expr type="prosody" label="emphasis">yes</expr> or <expr type="spell">AB</expr>.'
+        )
+        assert pf.convert_markup("elevenlabs", raw) == "Say yes or AB."
+        raw = 'hey <expr type="prosody" label="slow"/> there'
+        assert pf.convert_markup("elevenlabs", raw) == "hey there"
+
+    def test_steering_filters_sounds_and_examples(self) -> None:
+        from livekit.agents.tts import _provider_format as pf
+
+        instr = pf.llm_instructions("elevenlabs", {"nonverbal_sounds": False})
+        assert instr is not None
+        assert 'type="sound"' not in instr and "laugh" not in instr.lower()
+        assert "Examples:" in instr  # the sound-free examples survive
+
+        assert pf.supported_nonverbals("elevenlabs") == {
+            "laughing": ["laughs"],
+            "breathing": ["exhales"],
+            "sighing": ["sighs"],
+            "mouth_sounds": ["gulps"],
+        }
+        governed = [
+            label
+            for labels in pf._NONVERBAL_SOUND_LABELS["elevenlabs"].values()
+            for label in labels
+        ]
+        assert sorted(governed) == sorted(pf._ELEVENLABS_SOUNDS)
+
+    def test_transcript_keeps_only_the_words(self) -> None:
+        from livekit.agents.tts import _provider_format as pf
+
+        raw = (
+            '<expr type="expression" label="excited"/> Great news! '
+            '<expr type="sound" label="laughs"/> We did it.'
+        )
+        clean, tags = pf.split_all_markup(raw)
+        assert clean == "Great news! We did it."
+        assert {"type": "expression", "value": "excited"} in tags
+
+
 # ===========================================================================
 # Batch sentence tokenizer
 # ===========================================================================
