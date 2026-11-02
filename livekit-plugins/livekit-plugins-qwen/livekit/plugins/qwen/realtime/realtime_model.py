@@ -1039,7 +1039,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._push_output_audio(msg, pcm_frame(base64.b64decode(event.get("delta") or "")))
 
     def _handle_output_audio(self, frame: rtc.AudioFrame) -> None:
-        if self._done_watchdog is not None:
+        if self._done_watchdog is not None and self._audio_target is not None:
             self._arm_done_watchdog()
         msg = self._audio_target
         if msg is None or msg.audio_ch.closed:
