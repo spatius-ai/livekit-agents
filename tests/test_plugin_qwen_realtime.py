@@ -392,6 +392,72 @@ async def test_fatal_error_stops_the_session() -> None:
     assert errors and not errors[-1].recoverable
 
 
+def _video_frame(width: int = 1920, height: int = 1080) -> rtc.VideoFrame:
+    return rtc.VideoFrame(width, height, rtc.VideoBufferType.RGBA, b"\x80" * (width * height * 4))
+
+
+async def test_push_video_follows_audio_and_is_paced_and_scaled() -> None:
+    model = qwen.RealtimeModel(api_key=KEY)
+    transport = FakeTransport()
+    sizes: list[tuple[int, int]] = []
+
+    async def push_image(jpeg: bytes, width: int, height: int) -> None:
+        sizes.append((width, height))
+        transport.images.append(jpeg)
+
+    transport.push_image = push_image  # type: ignore[method-assign]
+    sess = await _start(model, transport)
+
+    sess.push_video(_video_frame())  # no audio yet
+    await _settle()
+    assert transport.images == []
+
+    sess.push_audio(
+        rtc.AudioFrame(
+            data=b"\x00\x00" * 1600, sample_rate=16000, num_channels=1, samples_per_channel=1600
+        )
+    )
+    sess.push_video(_video_frame())
+    sess.push_video(_video_frame())  # within the same second
+    for _ in range(50):
+        if transport.images:
+            break
+        await asyncio.sleep(0.01)
+    await _settle()
+    assert len(transport.images) == 1
+    assert transport.images[0][:2] == b"\xff\xd8"  # JPEG
+    assert sizes == [(1280, 720)]
+    await sess.aclose()
+
+
+@pytest.mark.parametrize(
+    ("size", "expected"),
+    [
+        ((1920, 1080), (1280, 720)),
+        ((1080, 1920), (720, 1280)),
+        ((640, 360), (640, 360)),
+    ],
+)
+def test_video_is_scaled_down_never_up(size: tuple[int, int], expected: tuple[int, int]) -> None:
+    assert _rt._fit(*size, 1280, 720) == expected
+
+
+async def test_aoq_warns_when_video_is_not_published(caplog: pytest.LogCaptureFixture) -> None:
+    transport = _aoq.AOQTransport(
+        credentials_url="u",
+        api_key=KEY,
+        http_session=None,  # type: ignore[arg-type]
+        timeout=1.0,
+        options=_aoq.AOQOptions(),
+    )
+    with caplog.at_level("WARNING", logger="livekit.plugins.qwen"):
+        await transport.push_image(b"jpeg", 640, 360)
+        await transport.push_image(b"jpeg", 640, 360)
+    assert [r.message for r in caplog.records].count(
+        "dropping video frames: the AOQ transport needs AOQOptions(publish_video=True) to send them"
+    ) == 1
+
+
 # ------------------------------------------------------------------ AOQ audio routing
 
 
@@ -597,10 +663,12 @@ async def test_aoq_transport_with_fake_sdk() -> None:
             api_key=KEY,
             http_session=None,  # type: ignore[arg-type]
             timeout=1.0,
-            options=_aoq.AOQOptions(),
+            options=_aoq.AOQOptions(publish_video=True),
         )
         await transport.connect()
         engine = sdk.AoqClientEngine.instance
+        encoder = next(args[0] for name, args in engine.calls if name == "set_video_encoder_config")
+        assert (encoder.kwargs["width"], encoder.kwargs["height"]) == (1280, 720)
         assert engine.connect_config.kwargs["token"] == "tok"
         assert engine.connect_config.kwargs["certificate"] == "fp"
         called = [name for name, _ in engine.calls]

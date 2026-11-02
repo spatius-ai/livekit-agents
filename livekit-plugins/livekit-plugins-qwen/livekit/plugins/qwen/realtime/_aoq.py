@@ -44,6 +44,8 @@ from ._transport import (
 
 SDK_PATH_ENV = "AOQ_CLIENT_SDK_PATH"
 _INPUT_STREAM_ID = "livekit_input"
+VIDEO_MAX_WIDTH = 1280
+VIDEO_MAX_HEIGHT = 720
 # The playback observer still delivers OUTPUT_SAMPLE_RATE. A 24 kHz decoder makes SDK 1.3.0 on Linux
 # x86_64 segfault in WebRtcOpus_DecoderInit on the first frame of model audio.
 _DECODE_SAMPLE_RATE = 48000
@@ -180,6 +182,7 @@ class AOQTransport(Transport):
         self._closing = False
         self._closed_reported = False
         self._media_enabled = False
+        self._warned_no_video = False
 
     async def connect(self) -> None:
         global _engine_owner
@@ -284,7 +287,11 @@ class AOQTransport(Transport):
                 "set_video_encoder_config",
                 engine.set_video_encoder_config(
                     sdk.AoqVideoCodecConfig(
-                        is_external=True, codec_type=sdk.AoqEncoderType.VIDEO_JPEG, fps=1
+                        is_external=True,
+                        codec_type=sdk.AoqEncoderType.VIDEO_JPEG,
+                        width=VIDEO_MAX_WIDTH,
+                        height=VIDEO_MAX_HEIGHT,
+                        fps=1,
                     )
                 ),
             )
@@ -433,7 +440,15 @@ class AOQTransport(Transport):
         logger.warning("AOQ input audio buffer full, dropping audio")
 
     async def push_image(self, jpeg: bytes, width: int, height: int) -> None:
-        if not self._opts.publish_video or not self._media_enabled:
+        if not self._opts.publish_video:
+            if not self._warned_no_video:
+                self._warned_no_video = True
+                logger.warning(
+                    "dropping video frames: the AOQ transport needs "
+                    "AOQOptions(publish_video=True) to send them"
+                )
+            return
+        if not self._media_enabled:
             return
         sdk = self._sdk
         rc = self._engine.push_external_video_encoded_frame(
@@ -443,7 +458,7 @@ class AOQTransport(Transport):
             ),
         )
         if rc != 0:
-            logger.debug("AOQ dropped a video frame", extra={"code": rc})
+            logger.warning("AOQ rejected a video frame", extra={"code": rc})
 
     def interrupt_output(self) -> None:
         if self._engine is not None:

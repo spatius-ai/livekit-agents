@@ -51,7 +51,7 @@ from ..models import (
     QwenTransport,
     TurnDetection,
 )
-from ._aoq import AOQOptions, AOQTransport
+from ._aoq import VIDEO_MAX_HEIGHT, VIDEO_MAX_WIDTH, AOQOptions, AOQTransport
 from ._transport import (
     INPUT_SAMPLE_RATE,
     NUM_CHANNELS,
@@ -97,7 +97,7 @@ _FATAL_ERROR_CODES = frozenset(
 
 _IMAGE_INTERVAL_S = 1.0
 _IMAGE_MAX_BYTES = 190 * 1024  # base64 must stay under 256 KB
-_IMAGE_MAX_SIZE = (1280, 720)  # 720p, the recommended upper bound
+_IMAGE_MAX_SIZE = (VIDEO_MAX_WIDTH, VIDEO_MAX_HEIGHT)  # 720p, the recommended upper bound
 _GENERATE_REPLY_TIMEOUT_S = 10.0
 # AOQ audio arrives on a media track that lags the data track: a reply's audio keeps
 # flowing after response.done, and may start before its message is announced
@@ -559,7 +559,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         resize = ResizeOptions(width=width, height=height, strategy="skew")
         jpeg = encode(frame, EncodeOptions(format="JPEG", resize_options=resize))
         if len(jpeg) > _IMAGE_MAX_BYTES:
-            logger.debug("video frame too large for Qwen-Omni-Realtime, skipping it")
+            logger.warning("video frame too large for Qwen-Omni-Realtime, skipping it")
             return
         with contextlib.suppress(utils.aio.channel.ChanClosed):
             self._msg_ch.send_nowait(_Image(jpeg, width, height))

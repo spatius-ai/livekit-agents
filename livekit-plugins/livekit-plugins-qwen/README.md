@@ -59,7 +59,17 @@ qwen.RealtimeModel(
 
 The SDK engine is a process-wide singleton, so a process can hold one AOQ session at a time. Agent
 jobs run in separate processes by default, so this only matters when several sessions share one.
-Set `AOQOptions(publish_video=True)` to send video frames on a video track.
+Set `AOQOptions(publish_video=True)` to send video frames on a video track; without it they are dropped,
+with a warning.
+
+Deployment notes, from running SDK 1.3.0 on Linux servers:
+
+- AOQ runs over QUIC, so it needs outbound UDP to the relays, on port 8443 at the time of testing. It may not
+  connect through a local proxy, even when HTTPS and WebSocket work.
+- The x86_64 SDK library needs an executable stack, so it won't load on glibc 2.41 or newer (for example Debian
+  trixie). Debian bookworm works.
+- The plugin sends JPEG frames rather than using the SDK's default H.264 encoder, which fails to start on
+  servers without a GPU (`encoder init error`).
 
 ## Notes
 
