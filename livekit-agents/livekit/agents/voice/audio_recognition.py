@@ -132,6 +132,11 @@ class _PreemptiveGenerationInfo:
 
 
 @dataclass
+class _PreflightStaleInfo:
+    new_transcript: str
+
+
+@dataclass
 class _UserTurnTracker:
     words: int = 0
     transcript: str = ""
@@ -157,6 +162,7 @@ class RecognitionHooks(Protocol):
     def on_eot_prediction(self, ev: EotPredictionEvent) -> None: ...
     def on_agent_backchannel_opportunity(self, ev: _AgentBackchannelOpportunityEvent) -> None: ...
     def on_preemptive_generation(self, info: _PreemptiveGenerationInfo) -> None: ...
+    def on_preflight_stale(self, info: _PreflightStaleInfo) -> None: ...
     def on_user_turn_exceeded(self, ev: UserTurnExceededEvent) -> None: ...
     def retrieve_chat_ctx(self) -> llm.ChatContext: ...
 
@@ -301,6 +307,8 @@ class AudioRecognition:
         self._turn_detection_mode = turn_detection if isinstance(turn_detection, str) else None
         self._vad_base_turn_detection = self._turn_detection_mode in ("vad", None)
         self._user_turn_committed = False  # true if user turn ended but EOU task not done
+        # Preserve the provider's end boundary across commits so late finals can end a turn.
+        self._stt_turn_ended = False
 
         self._sample_rate: int | None = None
 
@@ -418,6 +426,7 @@ class AudioRecognition:
                 previous_mode = self._turn_detection_mode
                 self._turn_detection_mode = mode
                 self._vad_base_turn_detection = self._turn_detection_mode in ("vad", None)
+                self._stt_turn_ended = False
 
                 if self._turn_detection_mode == "manual" or previous_mode == "manual":
                     if self._end_of_turn_task:
@@ -1055,6 +1064,7 @@ class AudioRecognition:
         self._last_speaking_time = None
         self._vad_speech_started = False
         self._user_turn_committed = False
+        self._stt_turn_ended = False
         self._last_emitted_prediction = None
         if self._turn_detector_stream is not None:
             self._turn_detector_stream.flush(reason="clear_user_turn")
@@ -1303,7 +1313,11 @@ class AudioRecognition:
             # check user turn limit after accumulating transcript
             self._check_user_turn_limit(transcript)
 
-            if self._vad_base_turn_detection or self._user_turn_committed:
+            if (
+                self._vad_base_turn_detection
+                or self._user_turn_committed
+                or (self._turn_detection_mode == "stt" and self._stt_turn_ended)
+            ):
                 if transcript_changed:
                     self._hooks.on_preemptive_generation(
                         _PreemptiveGenerationInfo(
@@ -1374,6 +1388,12 @@ class AudioRecognition:
             )
             self._audio_interim_transcript = ev.alternatives[0].text
 
+            if self._audio_preflight_transcript and self._audio_interim_transcript:
+                # the user kept talking after the preflight (e.g. Deepgram Flux TurnResumed)
+                self._hooks.on_preflight_stale(
+                    _PreflightStaleInfo(new_transcript=self._current_transcript)
+                )
+
         elif ev.type == stt.SpeechEventType.END_OF_SPEECH and self._turn_detection_mode == "stt":
             with tracer.use_span(self._ensure_user_turn_span()):
                 self._hooks.on_end_of_speech(None)
@@ -1401,6 +1421,7 @@ class AudioRecognition:
 
             self._speaking = False
             self._user_turn_committed = True
+            self._stt_turn_ended = True
 
             # always use STT speaking time since turn detection mode is set to STT. we would want
             # alignment here since _last_speaking_time is used for turn detection timing
@@ -1430,6 +1451,7 @@ class AudioRecognition:
                 self._hooks.on_start_of_speech(None, speech_start_time=self._speech_start_time)
 
             self._speaking = True
+            self._stt_turn_ended = False
             self._last_speaking_time = stt_last_speaking_time
 
             if self._end_of_turn_task is not None:
