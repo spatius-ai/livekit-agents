@@ -295,6 +295,35 @@ async def test_rejected_reply_fails_at_once_and_restores_instructions() -> None:
     await sess.aclose()
 
 
+async def test_missing_response_done_does_not_hang_the_reply() -> None:
+    model = qwen.RealtimeModel(api_key=KEY)
+    transport = FakeTransport()
+    with patch.object(_rt, "_RESPONSE_DONE_TIMEOUT_S", 0.05):
+        sess = await _start(model, transport)
+        generations: list[llm.GenerationCreatedEvent] = []
+        sess.on("generation_created", generations.append)
+        transport.server(type="response.created", response={"id": "resp_1"})
+        transport.server(type="response.output_item.added", item={"id": "i", "type": "message"})
+        transport.server(type="response.audio_transcript.delta", item_id="i", delta="Hi")
+        transport.server(type="response.output_item.done", item={"id": "i", "type": "message"})
+        await _settle()
+
+        text, _ = await asyncio.wait_for(_collect(generations[0]), 1)
+        assert text == "Hi"
+        assert not sess.has_active_generation
+        assert sess.chat_ctx.get_by_id("i") is not None
+
+        # interrupting arms it too, and a late response.done is harmless
+        transport.server(type="response.created", response={"id": "resp_2"})
+        await _settle()
+        sess.interrupt()
+        await asyncio.wait_for(_collect(generations[1]), 1)
+        transport.server(type="response.done", response={"id": "resp_2", "status": "cancelled"})
+        await _settle()
+        assert "response.cancel" in transport.types()
+        await sess.aclose()
+
+
 async def test_function_call_and_tool_output() -> None:
     model = qwen.RealtimeModel(api_key=KEY)
     transport = FakeTransport()

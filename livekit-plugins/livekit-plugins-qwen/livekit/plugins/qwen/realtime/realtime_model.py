@@ -100,6 +100,8 @@ _IMAGE_INTERVAL_S = 1.0
 _IMAGE_MAX_BYTES = 190 * 1024  # base64 must stay under 256 KB
 _IMAGE_MAX_SIZE = (VIDEO_MAX_WIDTH, VIDEO_MAX_HEIGHT)  # 720p, the recommended upper bound
 _GENERATE_REPLY_TIMEOUT_S = 10.0
+# response.done can fail to arrive (seen after a cancel over AOQ); consumers must not hang on it
+_RESPONSE_DONE_TIMEOUT_S = 3.0
 # AOQ audio arrives on a media track that lags the data track: a reply's audio keeps
 # flowing after response.done, and may start before its message is announced
 _AOQ_AUDIO_TAIL_S = 0.5
@@ -395,6 +397,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._response_created_futures: dict[str, asyncio.Future[llm.GenerationCreatedEvent]] = {}
         self._pending_reply_instructions: deque[str | None] = deque()
         self._current_generation: _ResponseGeneration | None = None
+        self._done_watchdog: asyncio.TimerHandle | None = None
         self._input_transcripts: dict[str, str] = {}
         self._speech_started_at: dict[str, float] = {}
 
@@ -638,6 +641,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
     def interrupt(self) -> None:
         if self._current_generation is not None:
             self.send_event({"type": "response.cancel"})
+            self._arm_done_watchdog()
         self._drop_output_audio()
 
     def truncate(
@@ -656,6 +660,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
     async def aclose(self) -> None:
         self._closing = True
+        self._cancel_done_watchdog()
         self._close_current_generation()
         self._close_audio_target()
         self._msg_ch.close()
@@ -726,6 +731,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     await transport.aclose()
                     self._transport = None
         finally:
+            self._cancel_done_watchdog()
             self._close_current_generation()
             self._close_audio_target()
             for fut in self._response_created_futures.values():
@@ -826,6 +832,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 self._handle_response_created(event)
             elif event_type == "response.output_item.added":
                 item = event.get("item") or {}
+                self._cancel_done_watchdog()
                 if item.get("type") == "message" and item.get("id"):
                     self._message(item["id"])
             elif event_type == "response.content_part.added":
@@ -936,6 +943,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
     def _handle_response_created(self, event: dict[str, Any]) -> None:
         response = event.get("response") or {}
         response_id = response.get("id") or utils.shortuuid("response_")
+        self._cancel_done_watchdog()
         self._close_current_generation()
         if self._is_aoq:
             self._close_audio_target()
@@ -1053,8 +1061,35 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         with contextlib.suppress(utils.aio.channel.ChanClosed):
             msg.audio_ch.send_nowait(frame)
 
+    def _arm_done_watchdog(self) -> None:
+        self._cancel_done_watchdog()
+        self._done_watchdog = asyncio.get_running_loop().call_later(
+            _RESPONSE_DONE_TIMEOUT_S, self._on_response_done_timeout
+        )
+
+    def _cancel_done_watchdog(self) -> None:
+        if self._done_watchdog is not None:
+            self._done_watchdog.cancel()
+            self._done_watchdog = None
+
+    def _on_response_done_timeout(self) -> None:
+        self._done_watchdog = None
+        if (generation := self._current_generation) is not None:
+            logger.warning("no response.done from Qwen-Omni-Realtime, finishing the reply anyway")
+            self._complete_generation(generation)
+
+    def _complete_generation(self, generation: _ResponseGeneration) -> None:
+        for item_id, msg in generation.messages.items():
+            if msg.transcript and self._chat_ctx.get_by_id(item_id) is None:
+                self._chat_ctx.add_message(role="assistant", content=msg.transcript, id=item_id)
+        self._finish_generation(generation)
+        if generation.restore_instructions:
+            self.send_event(self._session_update())
+
     def _handle_output_item_done(self, event: dict[str, Any]) -> None:
         item = event.get("item") or {}
+        if self._current_generation is not None:
+            self._arm_done_watchdog()
         if item.get("type") == "function_call":
             self._handle_function_call({**item, "item_id": item.get("id")})
         elif item.get("type") == "message" and (generation := self._current_generation):
@@ -1085,12 +1120,8 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         if generation is None:
             return
         response = event.get("response") or {}
-        for item_id, msg in generation.messages.items():
-            if msg.transcript and self._chat_ctx.get_by_id(item_id) is None:
-                self._chat_ctx.add_message(role="assistant", content=msg.transcript, id=item_id)
-        self._finish_generation(generation)
-        if generation.restore_instructions:
-            self.send_event(self._session_update())
+        self._cancel_done_watchdog()
+        self._complete_generation(generation)
 
         status = response.get("status")
         if status == "failed":
