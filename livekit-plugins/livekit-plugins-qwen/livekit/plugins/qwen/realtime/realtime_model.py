@@ -382,7 +382,8 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
         self._msg_ch = utils.aio.Chan[_Outgoing]()
         self._input_resampler: rtc.AudioResampler | None = None
-        chunk_ms = 20 if self._is_aoq else 100
+        # over AOQ, frames above 10 ms make the server's VAD split speech and detect its end late
+        chunk_ms = 10 if self._is_aoq else 100
         self._bstream = utils.audio.AudioByteStream(
             INPUT_SAMPLE_RATE,
             NUM_CHANNELS,

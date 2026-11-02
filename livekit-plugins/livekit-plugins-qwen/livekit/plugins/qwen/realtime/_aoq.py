@@ -44,6 +44,9 @@ from ._transport import (
 
 SDK_PATH_ENV = "AOQ_CLIENT_SDK_PATH"
 _INPUT_STREAM_ID = "livekit_input"
+# The playback observer still delivers OUTPUT_SAMPLE_RATE. A 24 kHz decoder makes SDK 1.3.0 on Linux
+# x86_64 segfault in WebRtcOpus_DecoderInit on the first frame of model audio.
+_DECODE_SAMPLE_RATE = 48000
 _BUFFER_FULL_RETRY_S = 0.02
 _BUFFER_FULL_MAX_RETRIES = 10
 
@@ -231,7 +234,7 @@ class AOQTransport(Transport):
         _check(
             "set_audio_decoder_config",
             engine.set_audio_decoder_config(
-                sdk.AoqAudioCodecConfig(**opus, sample_rate=OUTPUT_SAMPLE_RATE)
+                sdk.AoqAudioCodecConfig(**opus, sample_rate=_DECODE_SAMPLE_RATE)
             ),
         )
         _check(
