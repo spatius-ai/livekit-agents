@@ -75,6 +75,6 @@ Deployment notes, from running SDK 1.3.0 on Linux servers:
 
 - Conversation history is append-only: items can be added (user text, tool results) but not
   deleted or truncated.
-- Per-reply instructions (`generate_reply(instructions=...)`) are applied with a temporary
+- Per-reply instructions (`generate_reply(instructions=...)`) go on `response.create` and in a temporary
   `session.update`, restored once the reply is done.
 - Video frames are sent as JPEG at about one frame per second, at most 720p.

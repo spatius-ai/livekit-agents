@@ -6,9 +6,10 @@ plugin separate from ``livekit-plugins-openai``:
 * audio goes in at 16 kHz and comes out at 24 kHz;
 * conversation items can be added but not deleted or truncated, so the history is
   append-only;
-* ``response.create`` takes no parameters and responses carry no metadata, so a reply
-  request is matched to the next ``response.created``, and per-reply instructions are
-  applied with a temporary ``session.update``;
+* responses carry no metadata, so a reply request is matched to the next
+  ``response.created``. Per-reply instructions go on ``response.create``, which is the only
+  way to reply on an empty conversation, and in a temporary ``session.update``, since the
+  session's instructions win when the two conflict;
 * images are sent with ``input_image_buffer.append`` at about one frame per second;
 * there is a second transport, AOQ, where audio and video travel on media tracks.
 """
@@ -103,8 +104,6 @@ _GENERATE_REPLY_TIMEOUT_S = 10.0
 # flowing after response.done, and may start before its message is announced
 _AOQ_AUDIO_TAIL_S = 0.5
 _AOQ_AUDIO_EARLY_S = 1.0
-# the commit travels on the data track, ahead of audio still in the media pipeline
-_AOQ_COMMIT_DELAY_S = 0.3
 
 QwenEventTypes = Literal["qwen_server_event_received", "qwen_client_event_queued"]
 
@@ -610,14 +609,16 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
         reply_instructions: str | None = None
         if is_given(instructions) and instructions:
-            # response.create takes no parameters; widen the session instructions for
-            # this reply, and restore them once it is done
+            # widen the session instructions for this reply, restored once it is done
             reply_instructions = (
                 f"{self._instructions}\n{instructions}" if self._instructions else instructions
             )
             self.send_event(self._session_update(instructions=reply_instructions))
         self._pending_reply_instructions.append(reply_instructions)
-        self.send_event({"event_id": event_id, "type": "response.create"})
+        create: dict[str, Any] = {"event_id": event_id, "type": "response.create"}
+        if reply_instructions:
+            create["response"] = {"instructions": reply_instructions}
+        self.send_event(create)
 
         def _on_timeout() -> None:
             if not fut.done():
@@ -754,8 +755,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         elif isinstance(msg, _Image):
             await transport.push_image(msg.jpeg, msg.width, msg.height)
         else:
-            if self._is_aoq and msg.get("type") == "input_audio_buffer.commit":
-                await asyncio.sleep(_AOQ_COMMIT_DELAY_S)
             self.emit("qwen_client_event_queued", msg)
             await transport.send_event(msg)
 
@@ -853,6 +852,8 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         code = error.get("code")
         message = error.get("message") or "unknown error"
         fatal = code in _FATAL_ERROR_CODES
+        if "create response" in message:
+            self._reject_oldest_reply(message, code)
         logger.error(
             f"Qwen-Omni-Realtime returned an error: {message}",
             extra={"error": error},
@@ -861,6 +862,16 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         if fatal:
             raise err
         self._emit_error(err, recoverable=True)
+
+    def _reject_oldest_reply(self, message: str, code: str | None) -> None:
+        # errors name no client event: this one answers the oldest reply request
+        if self._pending_reply_instructions and self._pending_reply_instructions.popleft():
+            self.send_event(self._session_update())
+        for event_id, fut in list(self._response_created_futures.items()):
+            self._response_created_futures.pop(event_id, None)
+            if not fut.done():
+                fut.set_exception(llm.RealtimeError(message, code=code))
+                break
 
     def _handle_speech_started(self, event: dict[str, Any]) -> None:
         if item_id := event.get("item_id"):

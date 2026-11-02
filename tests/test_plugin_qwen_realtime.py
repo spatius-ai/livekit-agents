@@ -259,6 +259,8 @@ async def test_generate_reply_with_instructions() -> None:
 
     assert transport.types()[-2:] == ["session.update", "response.create"]
     assert transport.sent[-2]["session"]["instructions"] == "base\ngreet the user"
+    # without it, the server refuses to reply on an empty conversation
+    assert transport.sent[-1]["response"]["instructions"] == "base\ngreet the user"
 
     _response_events(transport)
     await _settle()
@@ -270,6 +272,26 @@ async def test_generate_reply_with_instructions() -> None:
     # restored once the reply is done
     assert transport.sent[-1]["type"] == "session.update"
     assert transport.sent[-1]["session"]["instructions"] == "base"
+    await sess.aclose()
+
+
+async def test_rejected_reply_fails_at_once_and_restores_instructions() -> None:
+    model = qwen.RealtimeModel(api_key=KEY)
+    transport = FakeTransport()
+    sess = await _start(model, transport)
+    await sess.update_instructions("base")
+    fut = sess.generate_reply(instructions="greet the user")
+    await _settle()
+
+    transport.server(
+        type="error",
+        error={"message": "Cannot create response without input, history, or instructions"},
+    )
+    with pytest.raises(llm.RealtimeError, match="Cannot create response"):
+        await asyncio.wait_for(fut, 1)
+    await _settle()
+    assert transport.sent[-1]["session"]["instructions"] == "base"
+    assert not sess.has_active_generation
     await sess.aclose()
 
 
