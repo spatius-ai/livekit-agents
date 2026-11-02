@@ -100,8 +100,10 @@ _IMAGE_INTERVAL_S = 1.0
 _IMAGE_MAX_BYTES = 190 * 1024  # base64 must stay under 256 KB
 _IMAGE_MAX_SIZE = (VIDEO_MAX_WIDTH, VIDEO_MAX_HEIGHT)  # 720p, the recommended upper bound
 _GENERATE_REPLY_TIMEOUT_S = 10.0
-# response.done can fail to arrive (seen after a cancel over AOQ); consumers must not hang on it
+# response.done can fail to arrive (seen after a cancel over AOQ); consumers must not hang on it.
+# Over AOQ it normally follows the audio, so the wait restarts with each audio frame.
 _RESPONSE_DONE_TIMEOUT_S = 3.0
+_CANCEL_DONE_TIMEOUT_S = 1.0
 # AOQ audio arrives on a media track that lags the data track: a reply's audio keeps
 # flowing after response.done, and may start before its message is announced
 _AOQ_AUDIO_TAIL_S = 0.5
@@ -641,7 +643,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
     def interrupt(self) -> None:
         if self._current_generation is not None:
             self.send_event({"type": "response.cancel"})
-            self._arm_done_watchdog()
+            self._arm_done_watchdog(_CANCEL_DONE_TIMEOUT_S)
         self._drop_output_audio()
 
     def truncate(
@@ -1037,6 +1039,8 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._push_output_audio(msg, pcm_frame(base64.b64decode(event.get("delta") or "")))
 
     def _handle_output_audio(self, frame: rtc.AudioFrame) -> None:
+        if self._done_watchdog is not None:
+            self._arm_done_watchdog()
         msg = self._audio_target
         if msg is None or msg.audio_ch.closed:
             self._early_audio.append((time.monotonic(), frame))
@@ -1061,10 +1065,11 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         with contextlib.suppress(utils.aio.channel.ChanClosed):
             msg.audio_ch.send_nowait(frame)
 
-    def _arm_done_watchdog(self) -> None:
+    def _arm_done_watchdog(self, timeout: float | None = None) -> None:
         self._cancel_done_watchdog()
         self._done_watchdog = asyncio.get_running_loop().call_later(
-            _RESPONSE_DONE_TIMEOUT_S, self._on_response_done_timeout
+            _RESPONSE_DONE_TIMEOUT_S if timeout is None else timeout,
+            self._on_response_done_timeout,
         )
 
     def _cancel_done_watchdog(self) -> None:

@@ -298,7 +298,10 @@ async def test_rejected_reply_fails_at_once_and_restores_instructions() -> None:
 async def test_missing_response_done_does_not_hang_the_reply() -> None:
     model = qwen.RealtimeModel(api_key=KEY)
     transport = FakeTransport()
-    with patch.object(_rt, "_RESPONSE_DONE_TIMEOUT_S", 0.05):
+    with (
+        patch.object(_rt, "_RESPONSE_DONE_TIMEOUT_S", 0.05),
+        patch.object(_rt, "_CANCEL_DONE_TIMEOUT_S", 0.05),
+    ):
         sess = await _start(model, transport)
         generations: list[llm.GenerationCreatedEvent] = []
         sess.on("generation_created", generations.append)
@@ -321,6 +324,30 @@ async def test_missing_response_done_does_not_hang_the_reply() -> None:
         transport.server(type="response.done", response={"id": "resp_2", "status": "cancelled"})
         await _settle()
         assert "response.cancel" in transport.types()
+        await sess.aclose()
+
+
+async def test_aoq_response_done_may_follow_the_audio() -> None:
+    model = qwen.RealtimeModel(api_key=KEY, transport="aoq", workspace_id="ws")
+    transport = FakeTransport(output_audio_in_events=False)
+    with patch.object(_rt, "_RESPONSE_DONE_TIMEOUT_S", 0.1):
+        sess = await _start(model, transport)
+        metrics: list[Any] = []
+        sess.on("metrics_collected", metrics.append)
+        transport.server(type="response.created", response={"id": "resp_1"})
+        transport.server(type="response.output_item.added", item={"id": "i", "type": "message"})
+        transport.server(type="response.output_item.done", item={"id": "i", "type": "message"})
+        for _ in range(4):  # audio outlasts the timeout, which must not fire while it plays
+            await asyncio.sleep(0.05)
+            transport.inbox.put_nowait(OutputAudio(pcm_frame(b"\x01\x00" * 240)))
+        await _settle()
+        assert sess.has_active_generation
+        transport.server(type="response.done", response={"id": "resp_1", "status": "completed"})
+        await _settle()
+        assert not sess.has_active_generation
+        assert any(
+            isinstance(m, RealtimeModelMetrics) and m.request_id == "resp_1" for m in metrics
+        )
         await sess.aclose()
 
 
