@@ -42,6 +42,16 @@ non-speech sounds, or `turn_detection=None` to let the agent drive turn taking:
 qwen.RealtimeModel(turn_detection=qwen.TurnDetection(type="semantic_vad", silence_duration_ms=600))
 ```
 
+### WebSocket camera input
+
+WebSocket sends at most one JPEG image per second. Keep the caller's camera sampler at 1 fps too,
+so frames are reduced before reaching the plugin. Encoding runs off the event loop and retains only
+the latest pending frame. Camera input works before microphone audio and while the microphone is
+muted; generated silent PCM maintains the input timeline without opening a system microphone.
+Typed user messages briefly use manual mode so the message item includes fresh camera context,
+then restore the configured VAD mode. Model audio is delivered as soon as each WebSocket delta
+arrives, without playback pacing, for consumers such as avatar audio pipelines.
+
 ### AOQ transport
 
 The AOQ client SDK is not on PyPI. Download the Linux or macOS AOQ SDK from the

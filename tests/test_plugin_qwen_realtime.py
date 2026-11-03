@@ -478,7 +478,7 @@ def _video_frame(width: int = 1920, height: int = 1080) -> rtc.VideoFrame:
     return rtc.VideoFrame(width, height, rtc.VideoBufferType.RGBA, b"\x80" * (width * height * 4))
 
 
-async def test_push_video_follows_audio_and_is_paced_and_scaled() -> None:
+async def test_websocket_video_waits_for_handshake_and_is_paced_and_scaled() -> None:
     model = qwen.RealtimeModel(api_key=KEY)
     transport = FakeTransport()
     sizes: list[tuple[int, int]] = []
@@ -490,16 +490,14 @@ async def test_push_video_follows_audio_and_is_paced_and_scaled() -> None:
     transport.push_image = push_image  # type: ignore[method-assign]
     sess = await _start(model, transport)
 
-    sess.push_video(_video_frame())  # no audio yet
+    sess.push_video(_video_frame())  # session has not been acknowledged yet
     await _settle()
     assert transport.images == []
 
-    sess.push_audio(
-        rtc.AudioFrame(
-            data=b"\x00\x00" * 1600, sample_rate=16000, num_channels=1, samples_per_channel=1600
-        )
-    )
-    sess.push_video(_video_frame())
+    transport.server(type="session.updated")
+    await _settle()
+    sess.push_video(_video_frame())  # microphone audio is optional
+
     sess.push_video(_video_frame())  # within the same second
     for _ in range(50):
         if transport.images:
@@ -555,15 +553,18 @@ async def test_aoq_paces_video_to_video_fps_without_microphone() -> None:
     await sess.aclose()
 
 
-async def test_aoq_video_keeps_latest_frame_and_does_not_block_audio() -> None:
+@pytest.mark.parametrize("transport_mode", ["websocket", "aoq"])
+async def test_aoq_video_keeps_latest_frame_and_does_not_block_audio(transport_mode: str) -> None:
     model = qwen.RealtimeModel(
         api_key=KEY,
-        transport="aoq",
+        transport=transport_mode,  # type: ignore[arg-type]
         workspace_id="ws",
         aoq_options=qwen.AOQOptions(publish_video=True),
     )
     transport = FakeTransport()
     sess = await _start(model, transport)
+    if transport_mode == "websocket":
+        sess._image_interval_s = 0.01
     transport.server(type="session.updated")
     await _settle()
     loop = asyncio.get_running_loop()
@@ -596,12 +597,13 @@ async def test_aoq_video_keeps_latest_frame_and_does_not_block_audio() -> None:
                 sess.push_video(_video_frame(width, 360))
             assert sess._pending_video is not None and sess._pending_video.width == 650
             assert encoded == [640]
+            samples = 1600 if transport_mode == "websocket" else 160
             sess.push_audio(
                 rtc.AudioFrame(
-                    data=b"\x00\x00" * 160,
+                    data=b"\x00\x00" * samples,
                     sample_rate=16000,
                     num_channels=1,
-                    samples_per_channel=160,
+                    samples_per_channel=samples,
                 )
             )
             sess.send_event({"type": "test.control"})
@@ -619,10 +621,11 @@ async def test_aoq_video_keeps_latest_frame_and_does_not_block_audio() -> None:
             await sess.aclose()
 
 
-async def test_aoq_close_joins_encoding_and_discards_its_result() -> None:
+@pytest.mark.parametrize("transport_mode", ["websocket", "aoq"])
+async def test_aoq_close_joins_encoding_and_discards_its_result(transport_mode: str) -> None:
     model = qwen.RealtimeModel(
         api_key=KEY,
-        transport="aoq",
+        transport=transport_mode,  # type: ignore[arg-type]
         workspace_id="ws",
         aoq_options=qwen.AOQOptions(publish_video=True),
     )
@@ -658,10 +661,13 @@ async def test_aoq_close_joins_encoding_and_discards_its_result() -> None:
 
 
 @pytest.mark.parametrize("cancel_target", ["close", "main"])
-async def test_aoq_cancelled_shutdown_still_joins_encoding(cancel_target: str) -> None:
+@pytest.mark.parametrize("transport_mode", ["websocket", "aoq"])
+async def test_aoq_cancelled_shutdown_still_joins_encoding(
+    cancel_target: str, transport_mode: str
+) -> None:
     model = qwen.RealtimeModel(
         api_key=KEY,
-        transport="aoq",
+        transport=transport_mode,  # type: ignore[arg-type]
         workspace_id="ws",
         aoq_options=qwen.AOQOptions(publish_video=True),
     )
@@ -714,10 +720,13 @@ async def test_aoq_cancelled_shutdown_still_joins_encoding(cancel_target: str) -
                 await asyncio.gather(close, return_exceptions=True)
 
 
-async def test_aoq_reconnect_discards_old_encoding_and_requires_fresh_handshake() -> None:
+@pytest.mark.parametrize("transport_mode", ["websocket", "aoq"])
+async def test_aoq_reconnect_discards_old_encoding_and_requires_fresh_handshake(
+    transport_mode: str,
+) -> None:
     model = qwen.RealtimeModel(
         api_key=KEY,
-        transport="aoq",
+        transport=transport_mode,  # type: ignore[arg-type]
         workspace_id="ws",
         aoq_options=qwen.AOQOptions(publish_video=True),
         conn_options=APIConnectOptions(max_retry=1, retry_interval=0),

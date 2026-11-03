@@ -117,6 +117,23 @@ class WebSocketTransport(Transport):
         self._timeout = timeout
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._closing = False
+        self._close_task: asyncio.Task[None] | None = None
+        self._media_enabled = False
+        self._media_lock = asyncio.Lock()
+        self._audio_progress = asyncio.Event()
+        self._video_activity = asyncio.Event()
+        self._audio_clock_task: asyncio.Task[None] | None = None
+        self._clock_close_task: asyncio.Task[bool] | None = None
+        self._clock_error: APIConnectionError | None = None
+        self._audio_started_at: float | None = None
+        self._audio_duration_s = 0.0
+        self._audio_due_at = 0.0
+        self._real_audio_pending = 0
+        self._last_real_audio_at: float | None = None
+        self._video_active_until = 0.0
+        self._video_paused = False
+        self._video_dirty = False
+        self._last_video_accepted_at: float | None = None
 
     async def connect(self) -> None:
         headers = {"Authorization": f"Bearer {self._api_key}", "User-Agent": "LiveKit Agents"}
@@ -136,19 +153,134 @@ class WebSocketTransport(Transport):
         except asyncio.TimeoutError as e:
             raise APIConnectionError("Qwen-Omni-Realtime WebSocket connection timed out") from e
 
-    async def send_event(self, event: dict[str, Any]) -> None:
+    async def _send_event_locked(self, event: dict[str, Any]) -> None:
         assert self._ws is not None
+        if self._closing:
+            raise APIConnectionError("Qwen-Omni-Realtime WebSocket transport closed")
         await self._ws.send_str(json.dumps(event))
 
-    async def push_audio(self, pcm: bytes) -> None:
-        await self.send_event(
+    async def send_event(self, event: dict[str, Any]) -> None:
+        async with self._media_lock:
+            await self._send_event_locked(event)
+            item = event.get("item") or {}
+            if event.get("type") in ("input_audio_buffer.clear", "input_audio_buffer.commit") or (
+                event.get("type") == "conversation.item.create" and item.get("role") == "user"
+            ):
+                # Do not let the next image overtake fresh PCM while its ACK is in flight.
+                self._begin_input_turn()
+
+    def on_session_updated(self) -> None:
+        if not self._media_enabled and not self._closing:
+            self._media_enabled = True
+            self._audio_clock_task = asyncio.create_task(
+                self._audio_clock(), name="qwen.websocket.audio"
+            )
+            self._audio_clock_task.add_done_callback(self._on_audio_clock_done)
+
+    def _on_audio_clock_done(self, task: asyncio.Task[None]) -> None:
+        if (
+            not task.cancelled()
+            and task.exception() is not None
+            and not self._closing
+            and self._ws is not None
+        ):
+            self._clock_error = APIConnectionError("Qwen-Omni-Realtime input audio clock failed")
+            # Closing the socket wakes recv, so the session owns the error/reconnect path.
+            self._clock_close_task = asyncio.create_task(self._ws.close())
+
+    async def _append_audio_locked(self, pcm: bytes) -> None:
+        await self._send_event_locked(
             {"type": "input_audio_buffer.append", "audio": base64.b64encode(pcm).decode()}
         )
+        now = asyncio.get_running_loop().time()
+        if self._audio_started_at is None:
+            self._audio_started_at = now
+        duration = len(pcm) / (INPUT_SAMPLE_RATE * NUM_CHANNELS * 2)
+        self._audio_duration_s += duration
+        self._audio_due_at = max(now, self._audio_due_at) + duration
+        self._audio_progress.set()
+
+    async def push_audio(self, pcm: bytes) -> None:
+        self._real_audio_pending += 1
+        self._last_real_audio_at = asyncio.get_running_loop().time()
+        try:
+            async with self._media_lock:
+                await self._append_audio_locked(pcm)
+        finally:
+            self._real_audio_pending -= 1
+
+    async def _audio_clock(self) -> None:
+        # This is an input timeline, not playback pacing. Model output stays unpaced.
+        loop = asyncio.get_running_loop()
+        while True:
+            await self._video_activity.wait()
+            now = loop.time()
+            if now >= self._video_active_until:
+                self._video_activity.clear()
+                continue
+            if (
+                not self._real_audio_pending
+                and now + 1e-6 >= self._audio_due_at
+                and (self._last_real_audio_at is None or now - self._last_real_audio_at >= 0.2)
+            ):
+                async with self._media_lock:
+                    now = loop.time()
+                    if (
+                        not self._closing
+                        and not self._real_audio_pending
+                        and now + 1e-6 >= self._audio_due_at
+                        and (
+                            self._last_real_audio_at is None
+                            or now - self._last_real_audio_at >= 0.2
+                        )
+                    ):
+                        await self._append_audio_locked(bytes(INPUT_SAMPLE_RATE // 10 * 2))
+            # Never accumulate silence debt or send a burst after a stalled event loop.
+            await asyncio.sleep(0.1)
+
+    def _has_recent_video(self) -> bool:
+        return (
+            self._video_dirty
+            and self._last_video_accepted_at is not None
+            and asyncio.get_running_loop().time() - self._last_video_accepted_at < 2.0
+        )
+
+    def _begin_input_turn(self) -> None:
+        self._audio_started_at = None
+        self._audio_duration_s = 0.0
+        self._audio_due_at = asyncio.get_running_loop().time()
+        self._video_dirty = False
+        self._audio_progress.set()
+
+    async def _wait_camera_input(self, timeout: float) -> None:
+        async def wait() -> None:
+            while not self._closing:
+                self._audio_progress.clear()
+                if self._video_dirty and self._audio_duration_s + 1e-9 >= 0.2:
+                    return
+                await self._audio_progress.wait()
+            raise APIConnectionError("Qwen camera transport closed during input preparation")
+
+        await asyncio.wait_for(wait(), timeout)
 
     async def push_image(self, jpeg: bytes, width: int, height: int) -> None:
-        await self.send_event(
-            {"type": "input_image_buffer.append", "image": base64.b64encode(jpeg).decode()}
-        )
+        if not self._media_enabled or self._closing or self._video_paused:
+            return
+        loop = asyncio.get_running_loop()
+        self._video_active_until = loop.time() + 2.0
+        self._video_activity.set()
+        async with self._media_lock:
+            if self._closing or self._video_paused:
+                return
+            # TCP ordering makes this audio append precede the image, even with no microphone.
+            if self._audio_started_at is None:
+                await self._append_audio_locked(bytes(INPUT_SAMPLE_RATE // 10 * 2))
+            await self._send_event_locked(
+                {"type": "input_image_buffer.append", "image": base64.b64encode(jpeg).decode()}
+            )
+            self._video_dirty = True
+            self._last_video_accepted_at = loop.time()
+            self._audio_progress.set()
 
     async def recv(self) -> TransportMessage:
         assert self._ws is not None
@@ -159,6 +291,8 @@ class WebSocketTransport(Transport):
                 aiohttp.WSMsgType.CLOSING,
                 aiohttp.WSMsgType.CLOSED,
             ):
+                if self._clock_error is not None:
+                    return TransportClosed(self._clock_error)
                 if self._closing:
                     return TransportClosed()
                 return TransportClosed(
@@ -171,10 +305,30 @@ class WebSocketTransport(Transport):
             try:
                 return ServerEvent(json.loads(msg.data))
             except json.JSONDecodeError:
-                logger.warning("invalid JSON from Qwen-Omni-Realtime", extra={"data": msg.data})
+                logger.warning("invalid JSON from Qwen-Omni-Realtime")
 
     async def aclose(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._aclose(), name="qwen.websocket.close")
+        await _join_task(self._close_task)
+
+    async def _aclose(self) -> None:
         self._closing = True
+        self._media_enabled = False
+        self._video_paused = False
+        self._video_dirty = False
+        self._video_activity.clear()
+        self._audio_progress.set()
+        if self._audio_clock_task is not None:
+            self._audio_clock_task.cancel()
+            try:
+                await self._audio_clock_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("error while stopping the WebSocket input audio clock")
+        if self._clock_close_task is not None:
+            await self._clock_close_task
         if self._ws is not None and not self._ws.closed:
             await self._ws.close()
 
