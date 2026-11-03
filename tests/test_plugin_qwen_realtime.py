@@ -508,6 +508,43 @@ async def test_push_video_follows_audio_and_is_paced_and_scaled() -> None:
     await sess.aclose()
 
 
+async def test_aoq_paces_video_to_video_fps() -> None:
+    model = qwen.RealtimeModel(
+        api_key=KEY,
+        transport="aoq",
+        workspace_id="ws",
+        aoq_options=qwen.AOQOptions(publish_video=True, video_fps=20),
+    )
+    transport = FakeTransport()
+    sess = await _start(model, transport)
+    sess.push_audio(
+        rtc.AudioFrame(
+            data=b"\x00\x00" * 160, sample_rate=16000, num_channels=1, samples_per_channel=160
+        )
+    )
+    sess.push_video(_video_frame(640, 360))
+    sess.push_video(_video_frame(640, 360))  # within 50 ms
+    await asyncio.sleep(0.06)
+    sess.push_video(_video_frame(640, 360))
+    for _ in range(50):
+        if len(transport.images) >= 2:
+            break
+        await asyncio.sleep(0.01)
+    await _settle()
+    assert len(transport.images) == 2
+    await sess.aclose()
+
+
+def test_aoq_video_fps_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="video_fps"):
+        qwen.RealtimeModel(
+            api_key=KEY,
+            transport="aoq",
+            workspace_id="ws",
+            aoq_options=qwen.AOQOptions(video_fps=0),
+        )
+
+
 @pytest.mark.parametrize(
     ("size", "expected"),
     [
@@ -747,6 +784,7 @@ async def test_aoq_transport_with_fake_sdk() -> None:
         engine = sdk.AoqClientEngine.instance
         encoder = next(args[0] for name, args in engine.calls if name == "set_video_encoder_config")
         assert (encoder.kwargs["width"], encoder.kwargs["height"]) == (1280, 720)
+        assert encoder.kwargs["fps"] == 15
         assert engine.connect_config.kwargs["token"] == "tok"
         assert engine.connect_config.kwargs["certificate"] == "fp"
         called = [name for name, _ in engine.calls]

@@ -60,7 +60,19 @@ qwen.RealtimeModel(
 The SDK engine is a process-wide singleton, so a process can hold one AOQ session at a time. Agent
 jobs run in separate processes by default, so this only matters when several sessions share one.
 Set `AOQOptions(publish_video=True)` to send video frames on a video track; without it they are dropped,
-with a warning.
+with a warning. The track runs at `AOQOptions(video_fps=...)`, 15 fps by default, as in Alibaba's AOQ
+real-time call example. `AgentSession` samples video at about 1 fps by default, so pass it
+`video_sampler=None` to forward camera frames at the full rate:
+
+```python
+session = AgentSession(
+    llm=qwen.RealtimeModel(
+        transport="aoq",
+        aoq_options=qwen.AOQOptions(publish_video=True, video_fps=15),
+    ),
+    video_sampler=None,  # the plugin paces frames to video_fps
+)
+```
 
 Deployment notes, from running SDK 1.3.0 on Linux servers:
 
@@ -77,4 +89,5 @@ Deployment notes, from running SDK 1.3.0 on Linux servers:
   deleted or truncated.
 - Per-reply instructions (`generate_reply(instructions=...)`) go on `response.create` and in a temporary
   `session.update`, restored once the reply is done.
-- Video frames are sent as JPEG at about one frame per second, at most 720p.
+- Video frames are sent as JPEG, at most 720p: over WebSocket at about one frame per second, over AOQ at
+  `AOQOptions.video_fps`.

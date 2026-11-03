@@ -67,6 +67,10 @@ class AOQOptions:
     the gateway uses the IP the credentials request came from."""
     publish_video: bool = False
     """Publish a video track, so frames from ``push_video`` reach the model."""
+    video_fps: int = 15
+    """Frame rate of the published video, as in Alibaba's AOQ real-time call example. The
+    session sends at most this many frames per second. ``AgentSession`` samples video at about
+    1 fps by default, so pass ``video_sampler=None`` to it to reach this rate."""
     audio_bitrate: int = 32000
     """Opus bitrate of the published audio, in bps."""
 
@@ -291,7 +295,7 @@ class AOQTransport(Transport):
                         codec_type=sdk.AoqEncoderType.VIDEO_JPEG,
                         width=VIDEO_MAX_WIDTH,
                         height=VIDEO_MAX_HEIGHT,
-                        fps=1,
+                        fps=self._opts.video_fps,
                     )
                 ),
             )

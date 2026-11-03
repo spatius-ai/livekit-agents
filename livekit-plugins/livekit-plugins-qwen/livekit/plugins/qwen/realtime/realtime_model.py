@@ -11,7 +11,8 @@ plugin separate from ``livekit-plugins-openai``:
   way to reply on an empty conversation, and in a temporary ``session.update``, since the
   session's instructions win when the two conflict;
 * images are sent with ``input_image_buffer.append`` at about one frame per second;
-* there is a second transport, AOQ, where audio and video travel on media tracks.
+* there is a second transport, AOQ, where audio and video travel on media tracks, video at
+  ``AOQOptions.video_fps`` (15 by default).
 """
 
 from __future__ import annotations
@@ -223,6 +224,8 @@ class RealtimeModel(llm.RealtimeModel):
             )
         if transport not in ("websocket", "aoq"):
             raise ValueError(f"unknown transport {transport!r}")
+        if aoq_options is not None and aoq_options.video_fps <= 0:
+            raise ValueError("AOQOptions.video_fps must be positive")
 
         if not is_given(base_url):
             base_url = os.environ.get(BASE_URL_ENV) or NOT_GIVEN
@@ -395,6 +398,9 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._pushed_duration_s = 0.0
         self._audio_sent = False
         self._last_image_at = 0.0
+        self._image_interval_s = (
+            1.0 / self._opts.aoq.video_fps if self._is_aoq else _IMAGE_INTERVAL_S
+        )
 
         self._response_created_futures: dict[str, asyncio.Future[llm.GenerationCreatedEvent]] = {}
         self._pending_reply_instructions: deque[str | None] = deque()
@@ -555,8 +561,8 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
         now = time.monotonic()
-        # images may only follow audio, at about one per second
-        if not self._audio_sent or now - self._last_image_at < _IMAGE_INTERVAL_S:
+        # images may only follow audio, at most one per interval
+        if not self._audio_sent or now - self._last_image_at < self._image_interval_s:
             return
         self._last_image_at = now
         width, height = _fit(frame.width, frame.height, *_IMAGE_MAX_SIZE)
