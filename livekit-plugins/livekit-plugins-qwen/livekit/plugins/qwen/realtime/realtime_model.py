@@ -561,7 +561,16 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             for _, item_id in diff.to_create
             for item in [chat_ctx.get_by_id(item_id)]
         )
-        prepared = await self._prepare_camera_text() if has_user_text else None
+        prepared: AOQTransport | None = None
+        if has_user_text:
+            try:
+                prepared = await self._prepare_camera_text()
+            except APIError as e:
+                # the typed message matters more than the camera context it would carry
+                logger.warning(
+                    "could not commit camera input before typed input, sending it without",
+                    extra={"error": str(e)},
+                )
         for _, item_id in diff.to_create:
             item = chat_ctx.get_by_id(item_id)
             if item is None or item_id in self._server_item_ids:

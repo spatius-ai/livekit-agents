@@ -1681,15 +1681,15 @@ async def test_speech_racing_typed_camera_is_not_manually_committed(
 
 
 @pytest.mark.virtual_time
-async def test_typed_camera_provider_error_aborts_without_text_or_response(
+async def test_typed_camera_provider_error_still_sends_the_text(
     camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
 ) -> None:
     sess, protocol = camera_session
     protocol.commit_error = True
-    with pytest.raises(APIConnectionError):
-        await sess.update_chat_ctx(_camera_text(sess))
-    assert "conversation.item.create" not in protocol.types()
-    assert "response.create" not in protocol.types()
+    await sess.update_chat_ctx(_camera_text(sess))
+    await _settle()
+    assert protocol.types()[-1] == "conversation.item.create"
+    assert sess._camera_prepared_transport is None
     assert not protocol.manual
     assert not protocol.transport._video_paused
 
@@ -1703,8 +1703,7 @@ async def test_typed_camera_close_rejects_pending_ack_without_replay(
     preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
     await protocol.manual_requested.wait()
     await sess.aclose()
-    with pytest.raises(APIConnectionError):
-        await preparing
+    await preparing
     assert not sess._camera_waiters
     assert "input_audio_buffer.commit" not in protocol.types()
     assert "conversation.item.create" not in protocol.types()
@@ -1769,10 +1768,10 @@ async def test_typed_camera_error_during_fresh_media_wait_does_not_commit(
     await protocol.manual_requested.wait()
     await _settle()
     protocol.server(type="error", error={"message": "synthetic media preparation failure"})
-    with pytest.raises(APIConnectionError):
-        await preparing
+    await preparing
+    await _settle()
     assert not protocol.commit_requested.is_set()
-    assert "conversation.item.create" not in protocol.types()
+    assert protocol.types()[-1] == "conversation.item.create"
     assert not protocol.manual
     assert not protocol.transport._video_paused
 
