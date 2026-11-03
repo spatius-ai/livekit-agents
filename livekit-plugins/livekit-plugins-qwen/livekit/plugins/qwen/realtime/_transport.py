@@ -13,7 +13,7 @@ import json
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeVar
 
 import aiohttp
 
@@ -25,6 +25,25 @@ from ..log import logger
 INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000
 NUM_CHANNELS = 1
+
+
+_Result = TypeVar("_Result")
+
+
+async def _join_task(task: asyncio.Task[_Result]) -> _Result:
+    """Join owned work before propagating cancellation, including repeated cancellation."""
+    cancelled = False
+    try:
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    raise
+                cancelled = True
+    finally:
+        if cancelled:
+            raise asyncio.CancelledError
 
 
 @dataclass

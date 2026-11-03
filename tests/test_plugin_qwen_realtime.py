@@ -8,6 +8,7 @@ import enum
 import sys
 import threading
 import types
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from typing import Any
 from unittest.mock import patch
@@ -951,6 +952,7 @@ def _fake_sdk() -> types.ModuleType:
         AUDIO_EXTERNAL_BUFFER_FULL = 110
 
     class AudioSource(enum.IntEnum):
+        PUBLISH = 2
         PLAYBACK = 3
 
     @dataclass
@@ -982,6 +984,11 @@ def _fake_sdk() -> types.ModuleType:
             self.observer: Any = None
             self.sent: list[bytes] = []
             self.pushed: list[Any] = []
+            self.audio_results: list[int] = []
+            self.media: list[tuple[str, float, Any]] = []
+            self.published_audio = 0
+            self.publish_audio = True
+            self.rejected_images = 0
 
         @classmethod
         def create_engine(cls, cfg: Any, listener: Any) -> Engine:
@@ -1010,7 +1017,25 @@ def _fake_sdk() -> types.ModuleType:
             return 0
 
         def push_audio_external_stream_data(self, stream_id: str, frame: Any) -> int:
+            result = self.audio_results.pop(0) if self.audio_results else 0
             self.pushed.append(frame)
+            if result == 0:
+                loop = asyncio.get_running_loop()
+                self.media.append(("audio", loop.time(), frame.data))
+                if self.publish_audio:
+                    loop.call_later(0.01, self.publish, frame)
+            return result
+
+        def publish(self, frame: Any) -> None:
+            self.published_audio += 1
+            if self.observer is not None:
+                self.observer.on_publish_audio_frame(TrackType.AUDIO, frame)
+
+        def push_external_video_encoded_frame(self, track_type: Any, frame: Any) -> int:
+            if not self.published_audio:
+                self.rejected_images += 1
+                raise AssertionError("Error append image before append audio.")
+            self.media.append(("image", asyncio.get_running_loop().time(), frame.kwargs["data"]))
             return 0
 
         def __getattr__(self, name: str) -> Any:
@@ -1129,3 +1154,227 @@ async def test_aoq_transport_with_fake_sdk() -> None:
         await transport.aclose()
         assert sdk.AoqClientEngine.instance is None
         assert isinstance(await transport.recv(), TransportClosed)
+
+
+@pytest.fixture
+async def aoq_sdk_transport() -> AsyncIterator[tuple[_aoq.AOQTransport, Any]]:
+    sdk = _fake_sdk()
+
+    async def fake_fetch(**kwargs: Any) -> _aoq.AOQCredentials:
+        return _aoq.AOQCredentials(sid="sid", token="tok", cert_fingerprint="fp")
+
+    transport = _aoq.AOQTransport(
+        credentials_url="https://ws.test/api/v1/webrtc/realtime?model=m",
+        api_key=KEY,
+        http_session=None,  # type: ignore[arg-type]
+        timeout=1.0,
+        options=_aoq.AOQOptions(publish_video=True),
+    )
+
+    async def inline_to_thread(fn: Any, *args: Any) -> Any:
+        return fn(*args)
+
+    def connect_inline(engine: Any, config: Any) -> int:
+        engine.connect_config = config
+        engine.listener.on_connection_status_change(sdk.AoqConnectionStatus.CONNECTED)
+        return 0
+
+    with (
+        patch.dict(sys.modules, {"aoq_client_sdk": sdk}),
+        patch.object(_aoq, "fetch_aoq_credentials", fake_fetch),
+        patch.object(_aoq.asyncio, "to_thread", inline_to_thread),
+        patch.object(sdk.AoqClientEngine, "connect", connect_inline),
+    ):
+        await transport.connect()
+        engine = sdk.AoqClientEngine.instance
+        try:
+            yield transport, engine
+        finally:
+            await transport.aclose()
+            assert sdk.AoqClientEngine.instance is None
+
+
+@pytest.mark.virtual_time
+async def test_aoq_camera_primes_published_audio_without_microphone(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any], caplog: pytest.LogCaptureFixture
+) -> None:
+    transport, engine = aoq_sdk_transport
+    await transport.push_image(b"before-handshake", 640, 360)
+    await asyncio.sleep(0.1)
+    assert engine.media == []
+
+    transport.on_session_updated()
+    # Provisioning a video track does not start filler until camera frames arrive.
+    await asyncio.sleep(0.1)
+    assert engine.media == []
+    with caplog.at_level("INFO", logger="livekit.plugins.qwen"):
+        await transport.push_image(b"camera", 640, 360)
+    assert engine.rejected_images == 0
+    assert engine.media[-1][0] == "image"
+    audio = [(at, data) for kind, at, data in engine.media if kind == "audio"]
+    assert len(audio) >= 6
+    assert all(data == bytes(320) for _, data in audio)
+    assert engine.media[-1][1] - audio[0][0] >= _aoq._AUDIO_VIDEO_LEAD_S
+    assert all(b[0] - a[0] >= 0.01 - 1e-9 for a, b in zip(audio, audio[1:], strict=False))
+    assert "input audio timeline established" in caplog.text
+    assert "first video frame accepted" in caplog.text
+    capture = next(args[0] for name, args in engine.calls if name == "start_audio_capture")
+    assert capture.kwargs["is_external"] is True
+
+
+@pytest.mark.virtual_time
+async def test_aoq_camera_silence_yields_to_real_audio_and_resumes_when_muted(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+) -> None:
+    transport, engine = aoq_sdk_transport
+    transport.on_session_updated()
+    await transport.push_image(b"first", 640, 360)
+    before_speech = len(engine.media)
+    speech = b"\x01\x00" * 160
+    for _ in range(10):
+        await transport.push_audio(speech)
+        await asyncio.sleep(0.01)
+    speaking = engine.media[before_speech:]
+    assert [data for kind, _, data in speaking if kind == "audio"] == [speech] * 10
+
+    # Muting the browser microphone produces no more real PCM; video keeps a silent timeline.
+    await transport.push_image(b"muted", 640, 360)
+    muted_at = len(engine.media)
+    await asyncio.sleep(0.08)
+    assert any(kind == "audio" and data == bytes(320) for kind, _, data in engine.media[muted_at:])
+    await transport.push_image(b"still-muted", 640, 360)
+    assert [data for kind, _, data in engine.media if kind == "image"] == [
+        b"first",
+        b"muted",
+        b"still-muted",
+    ]
+    assert engine.rejected_images == 0
+
+
+@pytest.mark.virtual_time
+@pytest.mark.parametrize("failure", ["buffer_full", "rejected", "not_published"])
+async def test_aoq_video_requires_accepted_and_published_audio(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+    failure: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    transport, engine = aoq_sdk_transport
+    if failure != "not_published":
+        engine.audio_results = [110 if failure == "buffer_full" else 99] * 100
+    else:
+        engine.publish_audio = False
+    transport.on_session_updated()
+    start = asyncio.get_running_loop().time()
+    with caplog.at_level("WARNING", logger="livekit.plugins.qwen"):
+        await transport.push_image(b"blocked", 640, 360)
+        assert asyncio.get_running_loop().time() - start <= _aoq._VIDEO_IDLE_S + 1e-6
+        await transport.push_image(b"blocked-again", 640, 360)
+    assert not any(kind == "image" for kind, _, _ in engine.media)
+    assert engine.rejected_images == 0
+    assert caplog.text.count("input audio has not reached the publish pipeline") == 1
+    engine.audio_results = []
+    engine.publish_audio = True
+    await transport.push_image(b"recovered", 640, 360)
+    assert [data for kind, _, data in engine.media if kind == "image"] == [b"recovered"]
+
+
+@pytest.mark.virtual_time
+async def test_aoq_camera_idle_stops_silence_and_requires_fresh_timeline(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+) -> None:
+    transport, engine = aoq_sdk_transport
+    transport.on_session_updated()
+    await transport.push_image(b"first", 640, 360)
+    await asyncio.sleep(0.5)
+    count = len(engine.media)
+    await asyncio.sleep(0.5)
+    assert len(engine.media) == count
+    restarted_at = asyncio.get_running_loop().time()
+    await transport.push_image(b"resumed", 640, 360)
+    assert engine.media[-1][1] - restarted_at >= _aoq._AUDIO_VIDEO_LEAD_S
+    assert engine.rejected_images == 0
+    await transport.aclose()
+    closed_count = len(engine.media)
+    await asyncio.sleep(0.5)
+    assert len(engine.media) == closed_count
+    assert not any(task.get_name() == "qwen.aoq.audio" for task in asyncio.all_tasks())
+    assert _aoq._engine_owner is None
+
+
+@pytest.mark.virtual_time
+async def test_aoq_audio_clock_failure_does_not_leak_native_engine(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+) -> None:
+    transport, engine = aoq_sdk_transport
+
+    def broken_push(*args: Any) -> int:
+        raise RuntimeError("native audio push failed")
+
+    engine.push_audio_external_stream_data = broken_push
+    transport.on_session_updated()
+    pending_image = asyncio.create_task(transport.push_image(b"blocked", 640, 360))
+    await _settle()
+    closed = await transport.recv()
+    assert isinstance(closed, TransportClosed)
+    assert isinstance(closed.error, APIConnectionError)
+    await transport.aclose()
+    await pending_image
+    assert _aoq._engine_owner is None
+    assert any(name == "disconnect" for name, _ in engine.calls)
+
+
+@pytest.mark.virtual_time
+async def test_aoq_sparse_camera_frames_keep_audio_clock_running(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+) -> None:
+    transport, engine = aoq_sdk_transport
+    transport._opts.video_fps = 1
+    transport._video_idle_s = max(_aoq._VIDEO_IDLE_S, 2 / transport._opts.video_fps)
+    transport.on_session_updated()
+    await transport.push_image(b"one-fps-1", 640, 360)
+    start = transport._audio_started_at
+    await asyncio.sleep(1.0)
+    request_at = asyncio.get_running_loop().time()
+    await transport.push_image(b"one-fps-2", 640, 360)
+    assert transport._audio_started_at == start
+    assert engine.media[-1][1] == request_at
+    accepted = [at for kind, at, _ in engine.media if kind == "audio"]
+    assert max(b - a for a, b in zip(accepted, accepted[1:], strict=False)) <= 0.02 + 1e-9
+    assert engine.rejected_images == 0
+
+
+@pytest.mark.virtual_time
+async def test_aoq_new_connection_requires_new_audio_publication(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+) -> None:
+    transport, engine = aoq_sdk_transport
+    transport.on_session_updated()
+    await transport.push_image(b"old-connection", 640, 360)
+    assert engine.published_audio >= 6
+    await transport.aclose()
+
+    fresh = _aoq.AOQTransport(
+        credentials_url="https://ws.test/api/v1/webrtc/realtime?model=m",
+        api_key=KEY,
+        http_session=None,  # type: ignore[arg-type]
+        timeout=1.0,
+        options=_aoq.AOQOptions(publish_video=True),
+    )
+    try:
+        await fresh.connect()
+        fresh_engine = fresh._sdk.AoqClientEngine.instance
+        assert fresh_engine is not engine
+        assert fresh._audio_started_at is None
+        await fresh.push_image(b"before-handshake", 640, 360)
+        assert fresh_engine.media == []
+        fresh.on_session_updated()
+        start = asyncio.get_running_loop().time()
+        await fresh.push_image(b"fresh-connection", 640, 360)
+        assert fresh_engine.media[-1][1] - start >= _aoq._AUDIO_VIDEO_LEAD_S
+        assert fresh_engine.published_audio >= 6
+        assert fresh_engine.rejected_images == 0
+        assert [data for kind, _, data in fresh_engine.media if kind == "image"] == [
+            b"fresh-connection"
+        ]
+    finally:
+        await fresh.aclose()

@@ -39,6 +39,7 @@ from ._transport import (
     Transport,
     TransportClosed,
     TransportMessage,
+    _join_task,
     pcm_frame,
 )
 
@@ -51,6 +52,14 @@ VIDEO_MAX_HEIGHT = 720
 _DECODE_SAMPLE_RATE = 48000
 _BUFFER_FULL_RETRY_S = 0.02
 _BUFFER_FULL_MAX_RETRIES = 10
+# The external audio stream requires real-time 10 ms PCM, including silence while video is active.
+_AUDIO_FRAME_S = 0.01
+_SILENCE = bytes(INPUT_SAMPLE_RATE // 100 * NUM_CHANNELS * 2)
+# Queue acceptance is not transmission. Also observe the SDK's publish pipeline and allow several
+# native Opus packets to pass before submitting the first image. The SDK has no media delivery ACK.
+_AUDIO_VIDEO_LEAD_S = 0.06
+_AUDIO_STALE_S = 0.05
+_VIDEO_IDLE_S = 0.25
 
 
 @dataclass
@@ -187,6 +196,23 @@ class AOQTransport(Transport):
         self._closed_reported = False
         self._media_enabled = False
         self._warned_no_video = False
+        self._media_lock = asyncio.Lock()
+        self._audio_progress = asyncio.Event()
+        self._video_activity = asyncio.Event()
+        self._audio_clock_task: asyncio.Task[None] | None = None
+        self._close_task: asyncio.Task[None] | None = None
+        self._video_active_until = 0.0
+        self._video_idle_s = max(_VIDEO_IDLE_S, 2 / self._opts.video_fps)
+        self._audio_due_at = 0.0
+        self._audio_started_at: float | None = None
+        self._audio_published_s = 0.0
+        self._last_audio_publish_at = 0.0
+        self._real_audio_pending = 0
+        self._last_real_audio_at: float | None = None
+        self._audio_timeline_reported = False
+        self._first_video_reported = False
+        self._warned_audio_not_ready = False
+        self._warned_audio_rejected = False
 
     async def connect(self) -> None:
         global _engine_owner
@@ -280,6 +306,17 @@ class AOQTransport(Transport):
                 sdk.AoqAudioObserverConfig(sample_rate=OUTPUT_SAMPLE_RATE, channels=NUM_CHANNELS),
             ),
         )
+        if self._opts.publish_video:
+            _check(
+                "enable_publish_audio_frame_observer",
+                engine.enable_audio_frame_observer(
+                    True,
+                    sdk.AoqAudioSource.PUBLISH,
+                    sdk.AoqAudioObserverConfig(
+                        sample_rate=INPUT_SAMPLE_RATE, channels=NUM_CHANNELS
+                    ),
+                ),
+            )
         engine.enable_send_media_stream(sdk.AoqTrackType.AUDIO, False)
 
         publish = [
@@ -356,6 +393,11 @@ class AOQTransport(Transport):
         transport = self
 
         class _Observer(sdk.IAudioFrameObserver):  # type: ignore[misc]
+            def on_publish_audio_frame(self, track_type: Any, data: Any) -> None:
+                if track_type == sdk.AoqTrackType.AUDIO:
+                    duration = data.num_of_samples / (data.samples_per_sec or INPUT_SAMPLE_RATE)
+                    transport._threadsafe(transport._on_audio_published, duration)
+
             def on_playback_audio_frame(self, data: Any) -> None:
                 if data.auto_gen_mute or not data.data:
                     return  # filler the player generates while nothing is playing
@@ -394,6 +436,13 @@ class AOQTransport(Transport):
         if isinstance(event, dict):
             self._queue.put_nowait(ServerEvent(event))
 
+    def _on_audio_published(self, duration: float) -> None:
+        if not self._media_enabled or self._audio_started_at is None:
+            return
+        self._last_audio_publish_at = asyncio.get_running_loop().time()
+        self._audio_published_s += min(duration, 2 * _AUDIO_FRAME_S)
+        self._audio_progress.set()
+
     def _on_audio(self, data: bytes, sample_rate: int) -> None:
         self._queue.put_nowait(OutputAudio(pcm_frame(data, sample_rate)))
 
@@ -422,10 +471,20 @@ class AOQTransport(Transport):
         self._engine.enable_send_media_stream(self._sdk.AoqTrackType.AUDIO, True)
         if self._opts.publish_video:
             self._engine.enable_send_media_stream(self._sdk.AoqTrackType.VIDEO, True)
+            self._audio_clock_task = asyncio.create_task(self._audio_clock(), name="qwen.aoq.audio")
+            self._audio_clock_task.add_done_callback(self._on_audio_clock_done)
 
-    async def push_audio(self, pcm: bytes) -> None:
-        if not self._media_enabled:
-            return  # the model is not configured yet; this audio has nowhere to go
+    def _on_audio_clock_done(self, task: asyncio.Task[None]) -> None:
+        if not task.cancelled() and task.exception() is not None:
+            self._fail(APIConnectionError("AOQ input audio clock failed"))
+
+    def _reset_audio_timeline(self) -> None:
+        self._audio_started_at = None
+        self._audio_published_s = 0.0
+        self._last_audio_publish_at = 0.0
+        self._audio_progress.set()
+
+    async def _push_pcm(self, pcm: bytes, *, retry: bool) -> bool:
         sdk = self._sdk
         frame = sdk.AoqAudioFrameData(
             data=pcm,
@@ -434,14 +493,75 @@ class AOQTransport(Transport):
             num_of_channels=NUM_CHANNELS,
             samples_per_sec=INPUT_SAMPLE_RATE,
         )
-        for _ in range(_BUFFER_FULL_MAX_RETRIES):
-            rc = self._engine.push_audio_external_stream_data(_INPUT_STREAM_ID, frame)
+        attempts = _BUFFER_FULL_MAX_RETRIES if retry else 1
+        for attempt in range(attempts):
+            # The native calls themselves are synchronous. Do not hold the media lock during
+            # retry sleeps: fresh speech, publication callbacks and shutdown must keep progressing.
+            async with self._media_lock:
+                if not self._media_enabled or self._closing:
+                    return False
+                rc = self._engine.push_audio_external_stream_data(_INPUT_STREAM_ID, frame)
+                if rc == 0:
+                    now = asyncio.get_running_loop().time()
+                    if self._audio_started_at is None or now > self._audio_due_at + _AUDIO_STALE_S:
+                        self._reset_audio_timeline()
+                        self._audio_started_at = now
+                    self._audio_due_at = max(now, self._audio_due_at) + len(pcm) / (
+                        INPUT_SAMPLE_RATE * NUM_CHANNELS * 2
+                    )
+                    self._audio_progress.set()
+                    self._warned_audio_rejected = False
+                    return True
+                self._reset_audio_timeline()
             if rc != sdk.AoqErrorCode.AUDIO_EXTERNAL_BUFFER_FULL:
-                if rc != 0:
+                if retry or not self._warned_audio_rejected:
+                    self._warned_audio_rejected = True
                     logger.warning("AOQ dropped input audio", extra={"code": rc})
-                return
-            await asyncio.sleep(_BUFFER_FULL_RETRY_S)
-        logger.warning("AOQ input audio buffer full, dropping audio")
+                return False
+            if attempt + 1 < attempts:
+                await asyncio.sleep(_BUFFER_FULL_RETRY_S)
+        if retry:
+            logger.warning("AOQ input audio buffer full, dropping audio")
+        return False
+
+    async def push_audio(self, pcm: bytes) -> None:
+        if not self._media_enabled or self._closing:
+            return  # the model is not configured yet; this audio has nowhere to go
+        self._real_audio_pending += 1
+        self._last_real_audio_at = asyncio.get_running_loop().time()
+        try:
+            await self._push_pcm(pcm, retry=True)
+        finally:
+            self._real_audio_pending -= 1
+
+    async def _audio_clock(self) -> None:
+        loop = asyncio.get_running_loop()
+        while True:
+            await self._video_activity.wait()
+            now = loop.time()
+            if now >= self._video_active_until:
+                self._video_activity.clear()
+                continue
+            # Real microphone PCM owns its slots. A late event loop never causes a catch-up burst.
+            if (
+                not self._real_audio_pending
+                and now + 1e-6 >= self._audio_due_at
+                and (
+                    self._last_real_audio_at is None
+                    or now - self._last_real_audio_at >= 2 * _AUDIO_FRAME_S
+                )
+            ):
+                await self._push_pcm(_SILENCE, retry=False)
+            await asyncio.sleep(_AUDIO_FRAME_S)
+
+    def _audio_ready_for_video(self, now: float) -> bool:
+        return (
+            self._audio_started_at is not None
+            and now - self._audio_started_at >= _AUDIO_VIDEO_LEAD_S
+            and self._audio_published_s + 1e-9 >= _AUDIO_VIDEO_LEAD_S
+            and now - self._last_audio_publish_at <= _AUDIO_STALE_S
+            and now <= self._audio_due_at + _AUDIO_FRAME_S
+        )
 
     async def push_image(self, jpeg: bytes, width: int, height: int) -> None:
         if not self._opts.publish_video:
@@ -454,15 +574,55 @@ class AOQTransport(Transport):
             return
         if not self._media_enabled:
             return
-        sdk = self._sdk
-        rc = self._engine.push_external_video_encoded_frame(
-            sdk.AoqTrackType.VIDEO,
-            sdk.AoqVideoEncodedFrame(
-                codec=sdk.AoqEncoderType.VIDEO_JPEG, data=jpeg, width=width, height=height
-            ),
-        )
-        if rc != 0:
-            logger.warning("AOQ rejected a video frame", extra={"code": rc})
+        loop = asyncio.get_running_loop()
+        # Frame arrival activates the silent timeline, without capturing any system microphone.
+        # Camera unpublication stops new arrivals; expire the filler promptly after the last frame.
+        self._video_active_until = loop.time() + self._video_idle_s
+        self._video_activity.set()
+        deadline = loop.time() + min(self._timeout, _VIDEO_IDLE_S)
+        while self._media_enabled and not self._closing:
+            self._audio_progress.clear()
+            async with self._media_lock:
+                now = loop.time()
+                if self._audio_ready_for_video(now):
+                    if not self._audio_timeline_reported:
+                        assert self._audio_started_at is not None
+                        self._audio_timeline_reported = True
+                        logger.info(
+                            "AOQ input audio timeline established for video",
+                            extra={
+                                "audio_lead_ms": round((now - self._audio_started_at) * 1000),
+                                "published_audio_ms": round(self._audio_published_s * 1000),
+                            },
+                        )
+                    sdk = self._sdk
+                    rc = self._engine.push_external_video_encoded_frame(
+                        sdk.AoqTrackType.VIDEO,
+                        sdk.AoqVideoEncodedFrame(
+                            codec=sdk.AoqEncoderType.VIDEO_JPEG,
+                            data=jpeg,
+                            width=width,
+                            height=height,
+                        ),
+                    )
+                    if rc != 0:
+                        logger.warning("AOQ rejected a video frame", extra={"code": rc})
+                    elif not self._first_video_reported:
+                        self._first_video_reported = True
+                        logger.info("AOQ first video frame accepted by the SDK")
+                    return
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait_for(self._audio_progress.wait(), remaining)
+            except asyncio.TimeoutError:
+                break
+        if not self._closing and not self._warned_audio_not_ready:
+            self._warned_audio_not_ready = True
+            logger.warning(
+                "AOQ dropped a video frame: input audio has not reached the publish pipeline"
+            )
 
     def interrupt_output(self) -> None:
         if self._engine is not None:
@@ -480,12 +640,27 @@ class AOQTransport(Transport):
         return await self._queue.get()
 
     async def aclose(self) -> None:
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._aclose(), name="qwen.aoq.close")
+        await _join_task(self._close_task)
+
+    async def _aclose(self) -> None:
         global _engine_owner
 
-        if self._closing:
-            return
         self._closing = True
         self._media_enabled = False
+        self._video_activity.clear()
+        self._video_active_until = 0.0
+        self._reset_audio_timeline()
+        if self._audio_clock_task is not None:
+            self._audio_clock_task.cancel()
+            try:
+                await self._audio_clock_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("error while stopping the AOQ input audio clock")
+            self._audio_clock_task = None
         self._queue.put_nowait(TransportClosed())
         engine, sdk = self._engine, self._sdk
         self._engine = None

@@ -26,7 +26,7 @@ import weakref
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import aiohttp
@@ -63,6 +63,7 @@ from ._transport import (
     Transport,
     TransportClosed,
     WebSocketTransport,
+    _join_task,
     pcm_frame,
 )
 
@@ -358,24 +359,6 @@ class _Image:
 
 
 _Outgoing = dict[str, Any] | _AudioChunk | _Image
-
-_Result = TypeVar("_Result")
-
-
-async def _join_task(task: asyncio.Task[_Result]) -> _Result:
-    """Join owned work before propagating cancellation, including repeated cancellation."""
-    cancelled = False
-    try:
-        while True:
-            try:
-                return await asyncio.shield(task)
-            except asyncio.CancelledError:
-                if task.done():
-                    raise
-                cancelled = True
-    finally:
-        if cancelled:
-            raise asyncio.CancelledError
 
 
 def _encode_image(frame: rtc.VideoFrame) -> _Image | None:

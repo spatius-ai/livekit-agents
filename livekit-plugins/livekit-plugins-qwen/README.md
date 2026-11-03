@@ -63,7 +63,11 @@ Set `AOQOptions(publish_video=True)` to send video frames on a video track; with
 with a warning. The track runs at `AOQOptions(video_fps=...)`, 15 fps by default, as in Alibaba's AOQ
 real-time call example. `AgentSession` samples video at about 1 fps by default, so pass it
 `video_sampler=None` to forward camera frames at the full rate. AOQ accepts camera frames even
-before microphone audio arrives. JPEG encoding runs off the audio event loop, retaining only the
+before microphone audio arrives: while camera frames arrive, the plugin maintains a paced 10 ms
+PCM timeline with generated silence whenever real microphone audio is absent. This uses external
+audio input and never captures a system microphone. Images wait for accepted PCM and the SDK's
+audio publication pipeline to establish a short startup lead. JPEG encoding runs off the audio
+event loop, retaining only the
 latest pending frame when the camera or encoder outpaces the connection. Camera publication can
 start and stop during the conversation once the video track has been provisioned:
 
