@@ -15,8 +15,9 @@ from unittest.mock import patch
 import pytest
 
 from livekit import rtc
-from livekit.agents import APIError, llm
+from livekit.agents import APIConnectionError, APIError, llm
 from livekit.agents.metrics import RealtimeModelMetrics
+from livekit.agents.types import APIConnectOptions
 from livekit.plugins import qwen
 from livekit.plugins.qwen.realtime import _aoq, realtime_model as _rt
 from livekit.plugins.qwen.realtime._transport import (
@@ -508,31 +509,270 @@ async def test_push_video_follows_audio_and_is_paced_and_scaled() -> None:
     await sess.aclose()
 
 
-async def test_aoq_paces_video_to_video_fps() -> None:
+@pytest.mark.virtual_time
+async def test_aoq_paces_video_to_video_fps_without_microphone() -> None:
     model = qwen.RealtimeModel(
         api_key=KEY,
         transport="aoq",
         workspace_id="ws",
-        aoq_options=qwen.AOQOptions(publish_video=True, video_fps=20),
+        aoq_options=qwen.AOQOptions(publish_video=True, video_fps=15),
+    )
+    transport = FakeTransport()
+    sent_at: list[float] = []
+    loop = asyncio.get_running_loop()
+
+    async def encode_video(frame: rtc.VideoFrame) -> _rt._Image:
+        return _rt._Image(b"jpeg", frame.width, frame.height)
+
+    async def push_image(jpeg: bytes, width: int, height: int) -> None:
+        sent_at.append(loop.time())
+        transport.images.append(jpeg)
+
+    transport.push_image = push_image  # type: ignore[method-assign]
+    sess = await _start(model, transport)
+    with patch.object(sess, "_encode_video", encode_video):
+        # Frames cannot get ahead of the session handshake, even without a microphone.
+        sess.push_video(_video_frame(640, 360))
+        await _settle()
+        assert transport.images == []
+        transport.server(type="session.updated")
+        await _settle()
+        sess.push_video(_video_frame(640, 360))
+        await _settle()
+        assert len(transport.images) == 1
+        sess.push_video(_video_frame(640, 360))
+        sess.push_video(_video_frame(640, 360))
+        await _settle()
+        assert len(transport.images) == 1
+        await asyncio.sleep(1 / 15)
+        await _settle()
+        assert len(transport.images) == 2
+        assert sent_at[1] - sent_at[0] == pytest.approx(1 / 15)
+        assert transport.audio == []
+    await sess.aclose()
+
+
+async def test_aoq_video_keeps_latest_frame_and_does_not_block_audio() -> None:
+    model = qwen.RealtimeModel(
+        api_key=KEY,
+        transport="aoq",
+        workspace_id="ws",
+        aoq_options=qwen.AOQOptions(publish_video=True),
     )
     transport = FakeTransport()
     sess = await _start(model, transport)
-    sess.push_audio(
-        rtc.AudioFrame(
-            data=b"\x00\x00" * 160, sample_rate=16000, num_channels=1, samples_per_channel=160
-        )
-    )
-    sess.push_video(_video_frame(640, 360))
-    sess.push_video(_video_frame(640, 360))  # within 50 ms
-    await asyncio.sleep(0.06)
-    sess.push_video(_video_frame(640, 360))
-    for _ in range(50):
-        if len(transport.images) >= 2:
-            break
-        await asyncio.sleep(0.01)
+    transport.server(type="session.updated")
     await _settle()
-    assert len(transport.images) == 2
+    loop = asyncio.get_running_loop()
+    encoding = asyncio.Event()
+    sent = asyncio.Event()
+    release = threading.Event()
+    encoded: list[int] = []
+    worker_threads: list[int] = []
+    main_thread = threading.get_ident()
+
+    def encode_image(frame: rtc.VideoFrame) -> _rt._Image:
+        encoded.append(frame.width)
+        worker_threads.append(threading.get_ident())
+        if len(encoded) == 1:
+            loop.call_soon_threadsafe(encoding.set)
+            assert release.wait(2), "test did not release the blocked encoder"
+        return _rt._Image(str(frame.width).encode(), frame.width, frame.height)
+
+    async def push_image(jpeg: bytes, width: int, height: int) -> None:
+        transport.images.append(jpeg)
+        if len(transport.images) == 2:
+            sent.set()
+
+    transport.push_image = push_image  # type: ignore[method-assign]
+    with patch.object(_rt, "_encode_image", encode_image):
+        try:
+            sess.push_video(_video_frame(640, 360))
+            await asyncio.wait_for(encoding.wait(), 1)
+            for width in range(641, 651):
+                sess.push_video(_video_frame(width, 360))
+            assert sess._pending_video is not None and sess._pending_video.width == 650
+            assert encoded == [640]
+            sess.push_audio(
+                rtc.AudioFrame(
+                    data=b"\x00\x00" * 160,
+                    sample_rate=16000,
+                    num_channels=1,
+                    samples_per_channel=160,
+                )
+            )
+            sess.send_event({"type": "test.control"})
+            await _settle()
+            assert len(transport.audio) == 1
+            assert "test.control" in transport.types()
+            assert transport.images == []
+            release.set()
+            await asyncio.wait_for(sent.wait(), 1)
+            assert encoded == [640, 650]
+            assert transport.images == [b"640", b"650"]
+            assert all(thread != main_thread for thread in worker_threads)
+        finally:
+            release.set()
+            await sess.aclose()
+
+
+async def test_aoq_close_joins_encoding_and_discards_its_result() -> None:
+    model = qwen.RealtimeModel(
+        api_key=KEY,
+        transport="aoq",
+        workspace_id="ws",
+        aoq_options=qwen.AOQOptions(publish_video=True),
+    )
+    transport = FakeTransport()
+    sess = await _start(model, transport)
+    transport.server(type="session.updated")
+    await _settle()
+    loop = asyncio.get_running_loop()
+    encoding = asyncio.Event()
+    release = threading.Event()
+
+    def encode_image(frame: rtc.VideoFrame) -> _rt._Image:
+        loop.call_soon_threadsafe(encoding.set)
+        assert release.wait(2), "test did not release the blocked encoder"
+        return _rt._Image(b"old-frame", frame.width, frame.height)
+
+    with patch.object(_rt, "_encode_image", encode_image):
+        try:
+            sess.push_video(_video_frame(640, 360))
+            await asyncio.wait_for(encoding.wait(), 1)
+            sess.push_video(_video_frame(641, 360))
+            close = asyncio.create_task(sess.aclose())
+            await _settle()
+            assert not close.done()
+            assert sess._pending_video is None
+            release.set()
+            await asyncio.wait_for(close, 1)
+            assert transport.images == []
+            assert not sess._video_ready
+        finally:
+            release.set()
+            await sess.aclose()
+
+
+async def test_aoq_reconnect_discards_old_encoding_and_requires_fresh_handshake() -> None:
+    model = qwen.RealtimeModel(
+        api_key=KEY,
+        transport="aoq",
+        workspace_id="ws",
+        aoq_options=qwen.AOQOptions(publish_video=True),
+        conn_options=APIConnectOptions(max_retry=1, retry_interval=0),
+    )
+    first, second = FakeTransport(), FakeTransport()
+    transports = iter([first, second])
+    reconnected = asyncio.Event()
+
+    def create_transport(_: _rt.RealtimeSession) -> FakeTransport:
+        transport = next(transports)
+        if transport is second:
+            reconnected.set()
+        return transport
+
+    loop = asyncio.get_running_loop()
+    encoding = asyncio.Event()
+    fresh_sent = asyncio.Event()
+    release = threading.Event()
+    encoded: list[int] = []
+
+    def encode_image(frame: rtc.VideoFrame) -> _rt._Image:
+        encoded.append(frame.width)
+        if len(encoded) == 1:
+            loop.call_soon_threadsafe(encoding.set)
+            assert release.wait(2), "test did not release the blocked encoder"
+        return _rt._Image(str(frame.width).encode(), frame.width, frame.height)
+
+    async def push_image(jpeg: bytes, width: int, height: int) -> None:
+        second.images.append(jpeg)
+        fresh_sent.set()
+
+    second.push_image = push_image  # type: ignore[method-assign]
+    with (
+        patch.object(_rt.RealtimeSession, "_create_transport", create_transport),
+        patch.object(_rt, "_encode_image", encode_image),
+    ):
+        sess = model.session()
+        try:
+            await _settle()
+            first.server(type="session.updated")
+            await _settle()
+            sess.push_video(_video_frame(640, 360))
+            await asyncio.wait_for(encoding.wait(), 1)
+            sess.push_video(_video_frame(641, 360))
+            first.inbox.put_nowait(TransportClosed(APIConnectionError("retry")))
+            await _settle()
+            assert sess._pending_video is None and not sess._video_ready
+            release.set()
+            await asyncio.wait_for(reconnected.wait(), 1)
+            await _settle()
+            sess.push_video(_video_frame(642, 360))
+            await _settle()
+            assert encoded == [640]
+            second.server(type="session.updated")
+            await _settle()
+            sess.push_video(_video_frame(650, 360))
+            await asyncio.wait_for(fresh_sent.wait(), 1)
+            assert encoded == [640, 650]
+            assert first.images == [] and second.images == [b"650"]
+        finally:
+            release.set()
+            await sess.aclose()
+
+
+async def test_aoq_unpublished_video_skips_encoding(caplog: pytest.LogCaptureFixture) -> None:
+    model = qwen.RealtimeModel(api_key=KEY, transport="aoq", workspace_id="ws")
+    sess = await _start(model, FakeTransport())
+    with patch.object(_rt, "_encode_image") as encode_image:
+        with caplog.at_level("WARNING", logger="livekit.plugins.qwen"):
+            sess.push_video(_video_frame(640, 360))
+            sess.push_video(_video_frame(640, 360))
+        encode_image.assert_not_called()
+        assert sum("publish_video=True" in record.message for record in caplog.records) == 1
     await sess.aclose()
+
+
+@pytest.mark.virtual_time
+async def test_aoq_bad_video_encodes_do_not_stop_later_frames() -> None:
+    model = qwen.RealtimeModel(
+        api_key=KEY,
+        transport="aoq",
+        workspace_id="ws",
+        aoq_options=qwen.AOQOptions(publish_video=True),
+    )
+    transport = FakeTransport()
+    sess = await _start(model, transport)
+    transport.server(type="session.updated")
+    await _settle()
+    attempts = 0
+
+    async def encode_video(frame: rtc.VideoFrame) -> _rt._Image | None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ValueError("bad frame")
+        if attempts == 2:
+            return None  # oversized image
+        return _rt._Image(b"good-frame", frame.width, frame.height)
+
+    with patch.object(sess, "_encode_video", encode_video):
+        for _ in range(3):
+            sess.push_video(_video_frame(640, 360))
+            await _settle()
+            await asyncio.sleep(1 / 15)
+            await _settle()
+        assert attempts == 3
+        assert transport.images == [b"good-frame"]
+    await sess.aclose()
+
+
+def test_oversized_video_image_is_dropped(caplog: pytest.LogCaptureFixture) -> None:
+    with patch.object(_rt, "encode", return_value=b"x" * (_rt._IMAGE_MAX_BYTES + 1)):
+        with caplog.at_level("WARNING", logger="livekit.plugins.qwen"):
+            assert _rt._encode_image(_video_frame(640, 360)) is None
+    assert "video frame too large" in caplog.text
 
 
 def test_aoq_video_fps_must_be_positive() -> None:

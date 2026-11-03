@@ -360,6 +360,16 @@ class _Image:
 _Outgoing = dict[str, Any] | _AudioChunk | _Image
 
 
+def _encode_image(frame: rtc.VideoFrame) -> _Image | None:
+    width, height = _fit(frame.width, frame.height, *_IMAGE_MAX_SIZE)
+    resize = ResizeOptions(width=width, height=height, strategy="skew")
+    jpeg = encode(frame, EncodeOptions(format="JPEG", resize_options=resize))
+    if len(jpeg) > _IMAGE_MAX_BYTES:
+        logger.warning("video frame too large for Qwen-Omni-Realtime, skipping it")
+        return None
+    return _Image(jpeg, width, height)
+
+
 class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
     """A Qwen-Omni-Realtime session.
 
@@ -401,6 +411,12 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._image_interval_s = (
             1.0 / self._opts.aoq.video_fps if self._is_aoq else _IMAGE_INTERVAL_S
         )
+        # AOQ video uses one latest-frame slot, independently of audio/control messages.
+        self._pending_video: rtc.VideoFrame | None = None
+        self._video_available = asyncio.Event()
+        self._video_ready = False
+        self._video_generation = 0
+        self._warned_no_video = False
 
         self._response_created_futures: dict[str, asyncio.Future[llm.GenerationCreatedEvent]] = {}
         self._pending_reply_instructions: deque[str | None] = deque()
@@ -560,19 +576,87 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._audio_sent = True
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
+        if self._closing:
+            return
+        if self._is_aoq:
+            if not self._opts.aoq.publish_video:
+                if not self._warned_no_video:
+                    self._warned_no_video = True
+                    logger.warning(
+                        "dropping video frames: the AOQ transport needs "
+                        "AOQOptions(publish_video=True) to send them"
+                    )
+                return
+            if self._video_ready:
+                self._pending_video = frame
+                self._video_available.set()
+            return
+
         now = time.monotonic()
-        # images may only follow audio, at most one per interval
-        if not self._audio_sent or now - self._last_image_at < self._image_interval_s:
+        # WebSocket images may only follow audio, at about one per second.
+        if not self._audio_sent or now - self._last_image_at < _IMAGE_INTERVAL_S:
             return
         self._last_image_at = now
-        width, height = _fit(frame.width, frame.height, *_IMAGE_MAX_SIZE)
-        resize = ResizeOptions(width=width, height=height, strategy="skew")
-        jpeg = encode(frame, EncodeOptions(format="JPEG", resize_options=resize))
-        if len(jpeg) > _IMAGE_MAX_BYTES:
-            logger.warning("video frame too large for Qwen-Omni-Realtime, skipping it")
-            return
-        with contextlib.suppress(utils.aio.channel.ChanClosed):
-            self._msg_ch.send_nowait(_Image(jpeg, width, height))
+        image = _encode_image(frame)
+        if image is not None:
+            with contextlib.suppress(utils.aio.channel.ChanClosed):
+                self._msg_ch.send_nowait(image)
+
+    def _reset_video_input(self) -> None:
+        self._video_ready = False
+        self._video_generation += 1
+        self._pending_video = None
+        self._video_available.clear()
+
+    async def _encode_video(self, frame: rtc.VideoFrame) -> _Image | None:
+        # Cancelling to_thread does not stop its thread. Join the encode before another
+        # transport starts, and never let a completed encode send on its own.
+        task = asyncio.create_task(asyncio.to_thread(_encode_image, frame))
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            with contextlib.suppress(Exception):
+                await task
+            raise
+
+    async def _video_task(self, transport: Transport) -> None:
+        loop = asyncio.get_running_loop()
+        next_send_at = 0.0
+        while True:
+            await self._video_available.wait()
+            frame = self._pending_video
+            self._pending_video = None
+            self._video_available.clear()
+            if frame is None or not self._video_ready:
+                continue
+            generation = self._video_generation
+            try:
+                image = await self._encode_video(frame)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("failed to encode an AOQ video frame, skipping it")
+                image = None
+            delay = next_send_at - loop.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            if (
+                self._closing
+                or not self._video_ready
+                or generation != self._video_generation
+                or self._transport is not transport
+            ):
+                continue
+            # Pace unsuccessful encodes too, so a stream of large frames cannot monopolize CPU.
+            next_send_at = loop.time() + self._image_interval_s
+            if image is None:
+                continue
+            try:
+                await transport.push_image(image.jpeg, image.width, image.height)
+            except APIError:
+                raise
+            except Exception:
+                logger.exception("failed to send an AOQ video frame, skipping it")
 
     def commit_audio(self) -> None:
         for nf in self._bstream.flush():
@@ -668,6 +752,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
     async def aclose(self) -> None:
         self._closing = True
+        self._reset_video_input()
         self._cancel_done_watchdog()
         self._close_current_generation()
         self._close_audio_target()
@@ -736,6 +821,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     self._emit_error(e, recoverable=False)
                     raise
                 finally:
+                    self._reset_video_input()
                     await transport.aclose()
                     self._transport = None
         finally:
@@ -798,16 +884,20 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 elif isinstance(msg, ServerEvent):
                     self._handle_event(msg.event)
 
-        tasks = [
+        io_tasks = [
             asyncio.create_task(_send_task(), name="qwen.send"),
             asyncio.create_task(_recv_task(), name="qwen.recv"),
         ]
+        tasks = list(io_tasks)
+        if self._is_aoq and self._opts.aoq.publish_video:
+            tasks.append(asyncio.create_task(self._video_task(transport), name="qwen.video"))
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
-            await asyncio.gather(*tasks)
+            await asyncio.gather(*io_tasks)
         finally:
+            self._reset_video_input()
             await utils.aio.cancel_and_wait(*tasks)
 
     # ------------------------------------------------------------------ server events
@@ -819,6 +909,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             if event_type == "session.updated":
                 if self._transport is not None:
                     self._transport.on_session_updated()
+                    self._video_ready = self._is_aoq
             elif event_type == "error":
                 self._handle_error(event)
             elif event_type == "input_audio_buffer.speech_started":
