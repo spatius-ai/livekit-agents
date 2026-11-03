@@ -26,7 +26,7 @@ import weakref
 from collections import deque
 from collections.abc import Iterator
 from dataclasses import dataclass, field, replace
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
 import aiohttp
@@ -359,6 +359,24 @@ class _Image:
 
 _Outgoing = dict[str, Any] | _AudioChunk | _Image
 
+_Result = TypeVar("_Result")
+
+
+async def _join_task(task: asyncio.Task[_Result]) -> _Result:
+    """Join owned work before propagating cancellation, including repeated cancellation."""
+    cancelled = False
+    try:
+        while True:
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    raise
+                cancelled = True
+    finally:
+        if cancelled:
+            raise asyncio.CancelledError
+
 
 def _encode_image(frame: rtc.VideoFrame) -> _Image | None:
     width, height = _fit(frame.width, frame.height, *_IMAGE_MAX_SIZE)
@@ -612,12 +630,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         # Cancelling to_thread does not stop its thread. Join the encode before another
         # transport starts, and never let a completed encode send on its own.
         task = asyncio.create_task(asyncio.to_thread(_encode_image, frame))
-        try:
-            return await asyncio.shield(task)
-        except asyncio.CancelledError:
-            with contextlib.suppress(Exception):
-                await task
-            raise
+        return await _join_task(task)
 
     async def _video_task(self, transport: Transport) -> None:
         loop = asyncio.get_running_loop()
@@ -757,7 +770,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._close_current_generation()
         self._close_audio_target()
         self._msg_ch.close()
-        await self._main_atask
+        await _join_task(self._main_atask)
 
     # ------------------------------------------------------------------ connection
 
@@ -868,7 +881,8 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     raise
                 except Exception:
                     logger.exception("failed to send event to Qwen-Omni-Realtime")
-            await transport.aclose()
+            if not (self._is_aoq and self._opts.aoq.publish_video):
+                await transport.aclose()
 
         async def _recv_task() -> None:
             while True:
@@ -895,10 +909,12 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
-            await asyncio.gather(*io_tasks)
+            if not (self._is_aoq and self._opts.aoq.publish_video):
+                await asyncio.gather(*io_tasks)
         finally:
             self._reset_video_input()
-            await utils.aio.cancel_and_wait(*tasks)
+            cleanup = asyncio.create_task(utils.aio.cancel_and_wait(*tasks), name="qwen.cleanup")
+            await _join_task(cleanup)
 
     # ------------------------------------------------------------------ server events
 

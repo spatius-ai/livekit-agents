@@ -654,6 +654,63 @@ async def test_aoq_close_joins_encoding_and_discards_its_result() -> None:
             await sess.aclose()
 
 
+@pytest.mark.parametrize("cancel_target", ["close", "main"])
+async def test_aoq_cancelled_shutdown_still_joins_encoding(cancel_target: str) -> None:
+    model = qwen.RealtimeModel(
+        api_key=KEY,
+        transport="aoq",
+        workspace_id="ws",
+        aoq_options=qwen.AOQOptions(publish_video=True),
+    )
+    transport = FakeTransport()
+    sess = await _start(model, transport)
+    transport.server(type="session.updated")
+    await _settle()
+    loop = asyncio.get_running_loop()
+    encoding = asyncio.Event()
+    finished = threading.Event()
+    release = threading.Event()
+
+    def encode_image(frame: rtc.VideoFrame) -> _rt._Image:
+        loop.call_soon_threadsafe(encoding.set)
+        try:
+            assert release.wait(2), "test did not release the blocked encoder"
+            return _rt._Image(b"old-frame", frame.width, frame.height)
+        finally:
+            finished.set()
+
+    with patch.object(_rt, "_encode_image", encode_image):
+        close: asyncio.Task[None] | None = None
+        try:
+            sess.push_video(_video_frame(640, 360))
+            await asyncio.wait_for(encoding.wait(), 1)
+            close = asyncio.create_task(sess.aclose())
+            # Let shutdown cancel the worker, which must join its outstanding thread.
+            for _ in range(3):
+                await _settle()
+            target = close if cancel_target == "close" else sess._main_atask
+            for _ in range(2):
+                target.cancel()
+                await _settle()
+            assert not close.done()
+            assert not sess._main_atask.done()
+            assert not finished.is_set()
+            assert not transport.closed
+            release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await close
+            assert finished.is_set()
+            assert sess._main_atask.done()
+            assert transport.closed
+            assert transport.images == []
+            await _settle()
+            assert not [task for task in asyncio.all_tasks() if task.get_name() == "qwen.video"]
+        finally:
+            release.set()
+            if close is not None:
+                await asyncio.gather(close, return_exceptions=True)
+
+
 async def test_aoq_reconnect_discards_old_encoding_and_requires_fresh_handshake() -> None:
     model = qwen.RealtimeModel(
         api_key=KEY,
