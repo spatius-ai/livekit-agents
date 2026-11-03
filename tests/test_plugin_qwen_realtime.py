@@ -8,6 +8,7 @@ import enum
 import json
 import sys
 import threading
+import time
 import types
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -1000,7 +1001,21 @@ def _fake_sdk() -> types.ModuleType:
 
         @classmethod
         def destroy(cls) -> int:
+            if cls.instance is not None:
+                cls.instance.calls.append(("destroy", ()))
             cls.instance = None
+            return 0
+
+        def disconnect(self) -> int:
+            self.calls.append(("disconnect", ()))
+
+            def disconnected() -> None:
+                # like the SDK: disconnect finishes later, on its own thread
+                time.sleep(0.05)
+                self.calls.append(("disconnected", ()))
+                self.listener.on_connection_status_change(ConnectionStatus.DISCONNECTED)
+
+            threading.Thread(target=disconnected).start()
             return 0
 
         def connect(self, cfg: Any) -> int:
@@ -1423,6 +1438,21 @@ async def test_aoq_external_stream_is_added_after_connected(
     assert not transport._external_stream_added
     names = [name for name, _ in engine.calls]
     assert names.index("remove_audio_external_stream") < names.index("disconnect")
+
+
+async def test_aoq_teardown_stops_audio_and_waits_for_disconnect_before_destroy(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+) -> None:
+    transport, engine = aoq_sdk_transport
+    transport.on_session_updated()
+    await transport.aclose()
+    names = [name for name, _ in engine.calls]
+    # the playback thread must be stopped before the connection goes away
+    assert names.index("stop_audio_player") < names.index("disconnect")
+    assert names.index("stop_audio_capture") < names.index("disconnect")
+    assert engine.observer is None
+    # destroying during the SDK's asynchronous disconnect crashed its audio thread
+    assert names.index("disconnected") < names.index("destroy")
 
 
 @pytest.mark.virtual_time

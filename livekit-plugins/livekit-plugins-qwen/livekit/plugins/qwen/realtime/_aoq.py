@@ -60,6 +60,9 @@ _SILENCE = bytes(INPUT_SAMPLE_RATE // 100 * NUM_CHANNELS * 2)
 _AUDIO_VIDEO_LEAD_S = 0.06
 _AUDIO_STALE_S = 0.05
 _VIDEO_IDLE_S = 0.25
+# disconnect() only queues the work; destroying the engine before it finishes frees the audio
+# observer while the playback thread still calls it
+_DISCONNECT_TIMEOUT_S = 3.0
 
 
 @dataclass
@@ -192,6 +195,8 @@ class AOQTransport(Transport):
         self._engine: Any = None
         self._connected_fut: asyncio.Future[None] | None = None
         self._connected = False
+        # set from the SDK's thread, which the teardown thread waits on
+        self._disconnected = threading.Event()
         self._external_stream_added = False
         self._closing = False
         self._closed_reported = False
@@ -395,6 +400,8 @@ class AOQTransport(Transport):
                 logger.debug("AOQ warning", extra={"code": code, "aoq_message": message})
 
             def on_connection_status_change(self, status: Any) -> None:
+                if status in (sdk.AoqConnectionStatus.DISCONNECTED, sdk.AoqConnectionStatus.FAILED):
+                    transport._disconnected.set()
                 transport._threadsafe(transport._on_status, int(status))
 
             def on_data_msg(self, msg: Any) -> None:
@@ -741,7 +748,13 @@ class AOQTransport(Transport):
         self._engine = None
         try:
             if engine is not None:
-                await asyncio.to_thread(_teardown, sdk, engine, self._external_stream_added)
+                await asyncio.to_thread(
+                    _teardown,
+                    sdk,
+                    engine,
+                    self._external_stream_added,
+                    self._disconnected if self._connected else None,
+                )
         finally:
             self._external_stream_added = False
             with _engine_owner_lock:
@@ -749,20 +762,26 @@ class AOQTransport(Transport):
                     _engine_owner = None
 
 
-def _teardown(sdk: Any, engine: Any, external_stream_added: bool) -> None:
+def _teardown(
+    sdk: Any, engine: Any, external_stream_added: bool, disconnected: threading.Event | None
+) -> None:
+    # Stop the audio threads and their observer before the connection goes, and destroy the
+    # engine only once disconnect() has finished: it runs on the SDK's own thread.
     for step in (
+        lambda: engine.set_audio_frame_observer(None),
+        engine.stop_audio_player,
         lambda: (
             engine.remove_audio_external_stream(_INPUT_STREAM_ID) if external_stream_added else None
         ),
-        engine.disconnect,
-        lambda: engine.set_audio_frame_observer(None),
-        engine.stop_audio_player,
         engine.stop_audio_capture,
+        engine.disconnect,
     ):
         try:
             step()
         except Exception:
             logger.exception("error while closing the AOQ engine")
+    if disconnected is not None and not disconnected.wait(_DISCONNECT_TIMEOUT_S):
+        logger.warning("AOQ disconnect did not finish, destroying the engine anyway")
     sdk.AoqClientEngine.destroy()
 
 
