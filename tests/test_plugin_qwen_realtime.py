@@ -1466,11 +1466,13 @@ class _CameraProtocol:
     transport: _aoq.AOQTransport
     events: list[dict[str, Any]] = field(default_factory=list)
     auto_update: bool = True
+    auto_restore: bool = True
     auto_commit: bool = True
     commit_error: bool = False
     manual: bool = False
     commits: int = 0
     manual_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    # set when a conversation item arrives in manual mode, which commits the media buffer
     commit_requested: asyncio.Event = field(default_factory=asyncio.Event)
 
     def server(self, **event: Any) -> None:
@@ -1496,11 +1498,14 @@ class _CameraProtocol:
             self.manual = detection is None
             if self.manual:
                 self.manual_requested.set()
-            if self.auto_update:
+            if self.auto_update and (self.auto_restore or detection is None):
                 self.ack_update(detection)
         elif kind == "input_audio_buffer.commit":
+            # like the real service: server VAD keeps no silent audio to commit
+            raise AssertionError("camera input must be committed by the typed item")
+        elif kind == "conversation.item.create" and self.manual:
+            # AOQ commits the pending audio and camera frames with the item
             self.commit_requested.set()
-            assert self.manual, "silent camera input must be committed in manual mode"
             if self.commit_error:
                 self.server(type="error", error={"message": "synthetic commit failed"})
             elif self.auto_commit:
@@ -1572,7 +1577,7 @@ def _camera_text(sess: _rt.RealtimeSession) -> llm.ChatContext:
 
 
 @pytest.mark.virtual_time
-async def test_typed_camera_commits_fresh_manual_media_then_restores_vad(
+async def test_typed_camera_sends_text_in_manual_mode_then_restores_vad(
     camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
 ) -> None:
     sess, protocol = camera_session
@@ -1581,17 +1586,48 @@ async def test_typed_camera_commits_fresh_manual_media_then_restores_vad(
     await _settle()
     await reply
     types = protocol.types()
-    commit = types.index("input_audio_buffer.commit")
     text = types.index("conversation.item.create")
     response = types.index("response.create")
-    assert protocol.events[commit - 1]["session"]["turn_detection"] is None
-    assert protocol.events[commit + 1]["session"]["turn_detection"]["type"] == "server_vad"
-    assert commit < text < response
+    assert "input_audio_buffer.commit" not in types
+    assert protocol.events[text - 1]["session"]["turn_detection"] is None
+    assert protocol.events[text + 1]["session"]["turn_detection"]["type"] == "server_vad"
+    assert text < response
+    assert protocol.commits == 1
     assert not sess._camera_turn_manual and not protocol.transport._video_paused
     assert sess._opts.turn_detection is not None
     assert sess.capabilities.turn_detection
     assert protocol.transport._accepted_nonzero_pcm is False
     assert protocol.transport._published_nonzero_pcm is False
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_warns_when_the_item_commits_nothing(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sess, protocol = camera_session
+    protocol.auto_commit = False
+    with caplog.at_level("WARNING", logger="livekit.plugins.qwen"):
+        await sess.update_chat_ctx(_camera_text(sess))
+        assert "AOQ did not commit camera input with the typed message" not in caplog.messages
+        await asyncio.sleep(_rt._CAMERA_COMMIT_CHECK_S + 0.1)
+    assert "AOQ did not commit camera input with the typed message" in caplog.messages
+    assert protocol.types().count("conversation.item.create") == 1
+    assert protocol.manual is False
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_late_commit_does_not_warn(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sess, protocol = camera_session
+    protocol.auto_commit = False
+    with caplog.at_level("WARNING", logger="livekit.plugins.qwen"):
+        await sess.update_chat_ctx(_camera_text(sess))
+        protocol.ack_commit()  # after the VAD restore was acknowledged
+        await asyncio.sleep(_rt._CAMERA_COMMIT_CHECK_S + 0.1)
+    assert "AOQ did not commit camera input with the typed message" not in caplog.messages
 
 
 @pytest.mark.virtual_time
@@ -1619,17 +1655,20 @@ async def test_typed_camera_concurrent_instruction_update_keeps_manual_mode(
     camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
 ) -> None:
     sess, protocol = camera_session
-    protocol.auto_commit = False
+    protocol.auto_update = False
     preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
-    await protocol.commit_requested.wait()
+    await protocol.manual_requested.wait()
     await sess.update_instructions("Updated synthetic instructions")
     await _settle()
     assert protocol.events[-1]["session"]["turn_detection"] is None
-    protocol.ack_commit()
+    protocol.auto_update = True
+    protocol.ack_update(None)
+    protocol.ack_update(None)
     await preparing
     await _settle()
     assert protocol.manual is False
-    assert protocol.types()[-1] == "conversation.item.create"
+    assert protocol.commits == 1
+    assert protocol.types()[-2:] == ["conversation.item.create", "session.update"]
 
 
 @pytest.mark.virtual_time
@@ -1681,14 +1720,14 @@ async def test_speech_racing_typed_camera_is_not_manually_committed(
 
 
 @pytest.mark.virtual_time
-async def test_typed_camera_provider_error_still_sends_the_text(
+async def test_typed_camera_provider_error_sends_the_text_once(
     camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
 ) -> None:
     sess, protocol = camera_session
     protocol.commit_error = True
     await sess.update_chat_ctx(_camera_text(sess))
     await _settle()
-    assert protocol.types()[-1] == "conversation.item.create"
+    assert protocol.types().count("conversation.item.create") == 1
     assert sess._camera_prepared_transport is None
     assert not protocol.manual
     assert not protocol.transport._video_paused
@@ -1715,10 +1754,10 @@ async def test_cancelled_typed_camera_failed_restore_still_closes_transport(
     camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
 ) -> None:
     sess, protocol = camera_session
-    protocol.auto_commit = False
+    protocol.auto_restore = False
     preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
     await protocol.commit_requested.wait()
-    protocol.auto_update = False
+    await _settle()
     preparing.cancel()
     await _settle()
     preparing.cancel()

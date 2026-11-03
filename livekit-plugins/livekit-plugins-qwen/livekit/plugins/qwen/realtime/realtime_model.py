@@ -102,6 +102,8 @@ _IMAGE_INTERVAL_S = 1.0
 _IMAGE_MAX_BYTES = 190 * 1024  # base64 must stay under 256 KB
 _IMAGE_MAX_SIZE = (VIDEO_MAX_WIDTH, VIDEO_MAX_HEIGHT)  # 720p, the recommended upper bound
 _GENERATE_REPLY_TIMEOUT_S = 10.0
+# how long a typed message in manual mode may take to commit the camera frames
+_CAMERA_COMMIT_CHECK_S = 2.0
 # response.done can fail to arrive (seen after a cancel over AOQ); consumers must not hang on it.
 # Over AOQ it normally follows the audio, so the wait restarts with each audio frame.
 _RESPONSE_DONE_TIMEOUT_S = 3.0
@@ -438,8 +440,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._session_update_acks: deque[tuple[Transport, asyncio.Future[None] | None, Any]] = (
             deque()
         )
-        self._input_commit_waiter: asyncio.Future[None] | None = None
-        self._input_commit_epoch = 0
+        self._input_commit_count = 0
         self._speech_epoch = 0
         self._committed_items: set[str] = set()
         self._speech_pending_commit = False
@@ -561,22 +562,13 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             for _, item_id in diff.to_create
             for item in [chat_ctx.get_by_id(item_id)]
         )
-        prepared: AOQTransport | None = None
-        if has_user_text:
-            try:
-                prepared = await self._prepare_camera_text()
-            except APIError as e:
-                # the typed message matters more than the camera context it would carry
-                logger.warning(
-                    "could not commit camera input before typed input, sending it without",
-                    extra={"error": str(e)},
-                )
+        events: list[dict[str, Any]] = []
         for _, item_id in diff.to_create:
             item = chat_ctx.get_by_id(item_id)
             if item is None or item_id in self._server_item_ids:
                 continue
             if item.type == "function_call_output":
-                self.send_event(
+                events.append(
                     {
                         "type": "conversation.item.create",
                         "item": {
@@ -587,22 +579,37 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     }
                 )
             elif item.type == "message" and item.role == "user" and item.text_content:
-                event = {
-                    "type": "conversation.item.create",
-                    "item": {
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": item.text_content}],
-                    },
-                }
-                if prepared is not None:
-                    self._msg_ch.send_nowait(_ScopedEvent(prepared, event))
-                else:
-                    self.send_event(event)
+                events.append(
+                    {
+                        "type": "conversation.item.create",
+                        "item": {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": item.text_content}],
+                        },
+                    }
+                )
             elif item.type == "message" and item.role in ("system", "developer"):
                 continue  # carried by the session instructions
             elif item.type in ("message", "function_call"):
                 skipped += 1
+        # the camera path sends what it can itself and leaves the rest in `pending`
+        pending = list(events)
+        prepared: AOQTransport | None = None
+        if has_user_text:
+            try:
+                prepared = await self._send_camera_text(pending)
+            except APIError as e:
+                # the typed message matters more than the camera context it would carry
+                logger.warning(
+                    "could not commit camera input with typed input, sending it without",
+                    extra={"error": str(e)},
+                )
+        for event in pending:
+            if prepared is not None:
+                self._msg_ch.send_nowait(_ScopedEvent(prepared, event))
+            else:
+                self.send_event(event)
         if skipped:
             logger.debug(
                 "Qwen-Omni-Realtime accepts only user text and tool results as history, "
@@ -639,18 +646,14 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 future.set_exception(APIConnectionError("AOQ camera input preparation interrupted"))
         self._input_committed.set()
 
-    async def _camera_control(
-        self, transport: AOQTransport, event: dict[str, Any], *, update: bool = False
-    ) -> None:
+    async def _camera_update(self, transport: AOQTransport) -> None:
+        """Send a session.update for the current camera mode and wait for its ack."""
         if not self._camera_transport_current(transport):
             raise APIConnectionError("AOQ camera transport changed during input preparation")
         future = asyncio.get_running_loop().create_future()
         self._camera_waiters.add(future)
-        if not update:
-            self._input_commit_waiter = future
-            self._input_commit_epoch = self._speech_epoch
         try:
-            await self._send(transport, event, session_ack=future if update else None)
+            await self._send(transport, self._session_update(), session_ack=future)
             await self._camera_wait(future)
             if not self._camera_transport_current(transport):
                 raise APIConnectionError("AOQ camera transport changed during input preparation")
@@ -660,12 +663,10 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 future.cancel()
             elif not future.cancelled():
                 future.exception()
-            if self._input_commit_waiter is future:
-                self._input_commit_waiter = None
 
     async def _restore_camera_vad(self, transport: AOQTransport) -> None:
         self._camera_turn_manual = False
-        await self._camera_control(transport, self._session_update(), update=True)
+        await self._camera_update(transport)
 
     async def _restore_camera_or_close(self, transport: AOQTransport) -> None:
         try:
@@ -673,6 +674,10 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         except Exception:
             await transport.aclose()
             raise
+
+    def _check_camera_commit(self, transport: AOQTransport, commits: int) -> None:
+        if self._input_commit_count == commits and self._camera_transport_current(transport):
+            logger.warning("AOQ did not commit camera input with the typed message")
 
     async def _wait_spoken_turn(self, transport: AOQTransport) -> None:
         try:
@@ -682,7 +687,15 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         if not self._camera_transport_current(transport) or self._speech_pending_commit:
             raise APIConnectionError("AOQ speech turn was interrupted before committing")
 
-    async def _prepare_camera_text(self) -> AOQTransport | None:
+    async def _send_camera_text(self, events: list[dict[str, Any]]) -> AOQTransport | None:
+        """Make typed input carry the camera, sending (and removing) what it can from ``events``.
+
+        Server VAD keeps no silent audio, so a commit fails while it is on. In manual mode AOQ
+        commits the pending audio and camera frames when a conversation item is created, so the
+        events are sent there, before VAD is restored. When a spoken turn is in flight its VAD
+        commit carries the camera instead and ``events`` are left to the caller. Returns the
+        transport later events of this turn must go to, or None when there is no camera.
+        """
         if not (self._is_aoq and self._opts.aoq.publish_video):
             return None
         async with self._camera_turn_lock:
@@ -711,7 +724,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             try:
                 if had_vad:
                     self._camera_turn_manual = True
-                    await self._camera_control(transport, self._session_update(), update=True)
+                    await self._camera_update(transport)
                     if self._speech_epoch != speech_epoch:
                         await self._restore_camera_vad(transport)
                         restored = True
@@ -733,10 +746,17 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     self._camera_prepared_transport = transport
                     return transport
                 transport._video_paused = True
-                await self._camera_control(transport, {"type": "input_audio_buffer.commit"})
+                commits = self._input_commit_count
+                while events:
+                    await self._send(transport, events[0])
+                    events.pop(0)
                 if had_vad:
                     await self._restore_camera_vad(transport)
                     restored = True
+                # the commit can arrive after the restore's ack; check without delaying the reply
+                asyncio.get_running_loop().call_later(
+                    _CAMERA_COMMIT_CHECK_S, self._check_camera_commit, transport, commits
+                )
                 self._camera_prepared_transport = transport
                 return transport
             finally:
@@ -1182,13 +1202,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 self._pushed_duration_s = 0
                 if isinstance(self._transport, AOQTransport):
                     self._transport._begin_input_turn()
-                if self._input_commit_waiter is not None and not self._input_commit_waiter.done():
-                    if self._input_commit_epoch == self._speech_epoch:
-                        self._input_commit_waiter.set_result(None)
-                    else:
-                        self._input_commit_waiter.set_exception(
-                            APIConnectionError("AOQ speech changed during camera input preparation")
-                        )
+                self._input_commit_count += 1
             elif event_type == "input_audio_buffer.speech_stopped":
                 self.emit(
                     "input_speech_stopped",
