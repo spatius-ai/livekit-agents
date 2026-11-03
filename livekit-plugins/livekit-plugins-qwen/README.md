@@ -68,7 +68,9 @@ PCM timeline with generated silence whenever real microphone audio is absent. Th
 audio input and never captures a system microphone. Images wait for accepted PCM and the SDK's
 audio publication pipeline to establish a short startup lead. JPEG encoding runs off the audio
 event loop, retaining only the
-latest pending frame when the camera or encoder outpaces the connection. Camera publication can
+latest pending frame when the camera or encoder outpaces the connection. Typed user messages briefly
+switch AOQ to manual mode to commit fresh camera context, then restore the configured VAD mode before
+requesting a reply. Spoken turns keep normal server turn detection. Camera publication can
 start and stop during the conversation once the video track has been provisioned:
 
 ```python

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import enum
+import json
 import sys
 import threading
 import types
@@ -989,6 +990,8 @@ def _fake_sdk() -> types.ModuleType:
             self.published_audio = 0
             self.publish_audio = True
             self.rejected_images = 0
+            self.connected = False
+            self.external_streams: set[str] = set()
 
         @classmethod
         def create_engine(cls, cfg: Any, listener: Any) -> Engine:
@@ -1002,10 +1005,28 @@ def _fake_sdk() -> types.ModuleType:
 
         def connect(self, cfg: Any) -> int:
             self.connect_config = cfg
-            threading.Thread(
-                target=self.listener.on_connection_status_change,
-                args=(ConnectionStatus.CONNECTED,),
-            ).start()
+            self.calls.append(("connect", (cfg,)))
+            # Native connect rebuilds its input pipeline; pre-connect streams are lost.
+            self.external_streams.clear()
+
+            def connected() -> None:
+                self.connected = True
+                self.calls.append(("connected", ()))
+                self.listener.on_connection_status_change(ConnectionStatus.CONNECTED)
+
+            threading.Thread(target=connected).start()
+            return 0
+
+        def add_audio_external_stream(self, stream_id: str, cfg: Any) -> int:
+            self.calls.append(("add_audio_external_stream", (stream_id, cfg)))
+            if not self.connected:
+                return 99
+            self.external_streams.add(stream_id)
+            return 0
+
+        def remove_audio_external_stream(self, stream_id: str) -> int:
+            self.calls.append(("remove_audio_external_stream", (stream_id,)))
+            self.external_streams.discard(stream_id)
             return 0
 
         def set_audio_frame_observer(self, observer: Any) -> int:
@@ -1017,6 +1038,7 @@ def _fake_sdk() -> types.ModuleType:
             return 0
 
         def push_audio_external_stream_data(self, stream_id: str, frame: Any) -> int:
+            assert stream_id in self.external_streams
             result = self.audio_results.pop(0) if self.audio_results else 0
             self.pushed.append(frame)
             if result == 0:
@@ -1176,6 +1198,10 @@ async def aoq_sdk_transport() -> AsyncIterator[tuple[_aoq.AOQTransport, Any]]:
 
     def connect_inline(engine: Any, config: Any) -> int:
         engine.connect_config = config
+        engine.calls.append(("connect", (config,)))
+        engine.external_streams.clear()
+        engine.connected = True
+        engine.calls.append(("connected", ()))
         engine.listener.on_connection_status_change(sdk.AoqConnectionStatus.CONNECTED)
         return 0
 
@@ -1378,3 +1404,405 @@ async def test_aoq_new_connection_requires_new_audio_publication(
         ]
     finally:
         await fresh.aclose()
+
+
+async def test_aoq_external_stream_is_added_after_connected(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+) -> None:
+    transport, engine = aoq_sdk_transport
+    names = [name for name, _ in engine.calls]
+    assert names.index("start_audio_capture") < names.index("connect")
+    assert names.index("connect") < names.index("connected")
+    assert names.index("connected") < names.index("add_audio_external_stream")
+    assert transport._external_stream_added
+    assert _aoq._INPUT_STREAM_ID in engine.external_streams
+    transport.on_session_updated()
+    await transport.push_audio(b"\x01\x00" * 160)
+    assert engine.media[-1][2] == b"\x01\x00" * 160
+    await transport.aclose()
+    assert not transport._external_stream_added
+    names = [name for name, _ in engine.calls]
+    assert names.index("remove_audio_external_stream") < names.index("disconnect")
+
+
+@pytest.mark.virtual_time
+@pytest.mark.parametrize("callback_kind", ["generated", "empty"])
+async def test_aoq_generated_or_empty_publish_callbacks_do_not_unlock_video(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any], callback_kind: str
+) -> None:
+    transport, engine = aoq_sdk_transport
+    engine.publish_audio = False
+    transport.on_session_updated()
+    pending_image = asyncio.create_task(transport.push_image(b"blocked", 640, 360))
+    frame = transport._sdk.AoqAudioFrameData(
+        data=bytes(320) if callback_kind == "generated" else b"",
+        num_of_samples=160,
+        samples_per_sec=16000,
+        auto_gen_mute=callback_kind == "generated",
+    )
+    for _ in range(8):
+        engine.observer.on_publish_audio_frame(transport._sdk.AoqTrackType.AUDIO, frame)
+        await asyncio.sleep(0.01)
+    await pending_image
+    assert transport._accepted_pcm_frames > 0
+    assert transport._published_pcm_frames == 0
+    assert transport._audio_published_s == 0
+    assert not any(kind == "image" for kind, _, _ in engine.media)
+    if callback_kind == "generated":
+        assert transport._generated_publish_frames == 8
+    else:
+        assert transport._empty_publish_frames == 8
+    engine.publish_audio = True
+    await transport.push_audio(b"\x01\x00" * 160)
+    await transport.push_image(b"real-external-input", 640, 360)
+    assert transport._published_pcm_frames >= 6
+    assert transport._accepted_nonzero_pcm
+    assert transport._published_nonzero_pcm
+    assert engine.media[-1][0] == "image"
+
+
+@dataclass
+class _CameraProtocol:
+    transport: _aoq.AOQTransport
+    events: list[dict[str, Any]] = field(default_factory=list)
+    auto_update: bool = True
+    auto_commit: bool = True
+    commit_error: bool = False
+    manual: bool = False
+    commits: int = 0
+    manual_requested: asyncio.Event = field(default_factory=asyncio.Event)
+    commit_requested: asyncio.Event = field(default_factory=asyncio.Event)
+
+    def server(self, **event: Any) -> None:
+        self.transport._on_data(json.dumps(event).encode())
+
+    def ack_update(self, detection: Any) -> None:
+        # The real service omits null turn_detection in manual-mode acknowledgments.
+        self.server(
+            type="session.updated",
+            session={} if detection is None else {"turn_detection": detection},
+        )
+
+    def ack_commit(self) -> None:
+        self.commits += 1
+        self.server(type="input_audio_buffer.committed", item_id=f"camera-{self.commits}")
+
+    def send(self, message: Any) -> int:
+        event = json.loads(message.data)
+        self.events.append(event)
+        kind = event["type"]
+        if kind == "session.update":
+            detection = event["session"].get("turn_detection")
+            self.manual = detection is None
+            if self.manual:
+                self.manual_requested.set()
+            if self.auto_update:
+                self.ack_update(detection)
+        elif kind == "input_audio_buffer.commit":
+            self.commit_requested.set()
+            assert self.manual, "silent camera input must be committed in manual mode"
+            if self.commit_error:
+                self.server(type="error", error={"message": "synthetic commit failed"})
+            elif self.auto_commit:
+                self.ack_commit()
+        elif kind == "response.create":
+            self.server(type="response.created", response={"id": "camera-response"})
+            self.server(
+                type="response.done", response={"id": "camera-response", "status": "completed"}
+            )
+        return 0
+
+    def types(self) -> list[str]:
+        return [event["type"] for event in self.events]
+
+
+@pytest.fixture
+async def camera_session(
+    aoq_sdk_transport: tuple[_aoq.AOQTransport, Any],
+) -> AsyncIterator[tuple[_rt.RealtimeSession, _CameraProtocol]]:
+    transport, engine = aoq_sdk_transport
+    protocol = _CameraProtocol(transport)
+    engine.send_data_msg = protocol.send
+
+    async def already_connected() -> None:
+        pass
+
+    async def encode_video(frame: rtc.VideoFrame) -> _rt._Image:
+        return _rt._Image(b"synthetic-jpeg", 640, 360)
+
+    model = qwen.RealtimeModel(
+        api_key=KEY,
+        transport="aoq",
+        workspace_id="ws",
+        aoq_options=qwen.AOQOptions(publish_video=True),
+        conn_options=APIConnectOptions(max_retry=0, timeout=1.0),
+    )
+    with (
+        patch.object(transport, "connect", already_connected),
+        patch.object(_rt.RealtimeSession, "_create_transport", lambda self: transport),
+        patch.object(_rt.RealtimeSession, "_encode_video", lambda self, frame: encode_video(frame)),
+    ):
+        sess = model.session()
+        await _settle()
+        frame = _video_frame(640, 360)
+
+        async def camera() -> None:
+            while True:
+                sess.push_video(frame)
+                await asyncio.sleep(1 / 15)
+
+        pump = asyncio.create_task(camera())
+        try:
+            await transport._wait_camera_input(1.0)
+            yield sess, protocol
+        finally:
+            pump.cancel()
+            await asyncio.gather(pump, return_exceptions=True)
+            try:
+                await sess.aclose()
+            except (APIError, AttributeError):
+                # A failure test may deliberately close its fixed fake connection.
+                pass
+
+
+def _camera_text(sess: _rt.RealtimeSession) -> llm.ChatContext:
+    context = sess.chat_ctx
+    context.add_message(role="user", content="What color is the synthetic image?")
+    return context
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_commits_fresh_manual_media_then_restores_vad(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    await sess.update_chat_ctx(_camera_text(sess))
+    reply = sess.generate_reply()
+    await _settle()
+    await reply
+    types = protocol.types()
+    commit = types.index("input_audio_buffer.commit")
+    text = types.index("conversation.item.create")
+    response = types.index("response.create")
+    assert protocol.events[commit - 1]["session"]["turn_detection"] is None
+    assert protocol.events[commit + 1]["session"]["turn_detection"]["type"] == "server_vad"
+    assert commit < text < response
+    assert not sess._camera_turn_manual and not protocol.transport._video_paused
+    assert sess._opts.turn_detection is not None
+    assert sess.capabilities.turn_detection
+    assert protocol.transport._accepted_nonzero_pcm is False
+    assert protocol.transport._published_nonzero_pcm is False
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_waits_for_its_own_session_update_ack(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    protocol.auto_update = False
+    await sess.update_instructions("Synthetic safe instructions")
+    preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
+    await _settle()
+    assert len(sess._session_update_acks) == 2
+    protocol.ack_update({"type": "server_vad"})
+    await _settle()
+    assert not protocol.commit_requested.is_set()
+    assert not preparing.done()
+    protocol.auto_update = True
+    protocol.ack_update(None)
+    await preparing
+    assert protocol.commits == 1
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_concurrent_instruction_update_keeps_manual_mode(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    protocol.auto_commit = False
+    preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
+    await protocol.commit_requested.wait()
+    await sess.update_instructions("Updated synthetic instructions")
+    await _settle()
+    assert protocol.events[-1]["session"]["turn_detection"] is None
+    protocol.ack_commit()
+    await preparing
+    await _settle()
+    assert protocol.manual is False
+    assert protocol.types()[-1] == "conversation.item.create"
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_waits_for_vad_commit_not_only_speech_stop(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    protocol.server(type="input_audio_buffer.speech_started", item_id="spoken")
+    await _settle()
+    before = len(protocol.events)
+    preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
+    protocol.server(type="input_audio_buffer.speech_stopped", item_id="spoken")
+    await _settle()
+    assert not preparing.done()
+    assert len(protocol.events) == before
+    protocol.server(type="input_audio_buffer.committed", item_id="spoken")
+    await preparing
+    await _settle()
+    assert "input_audio_buffer.commit" not in protocol.types()
+    assert protocol.types()[-1] == "conversation.item.create"
+
+
+@pytest.mark.virtual_time
+@pytest.mark.parametrize("during_ack", [True, False])
+async def test_speech_racing_typed_camera_is_not_manually_committed(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+    during_ack: bool,
+) -> None:
+    sess, protocol = camera_session
+    protocol.auto_update = not during_ack
+    preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
+    await protocol.manual_requested.wait()
+    await _settle()
+    protocol.server(type="input_audio_buffer.speech_started", item_id="racing")
+    if during_ack:
+        protocol.auto_update = True
+        protocol.ack_update(None)
+    await _settle()
+    await asyncio.sleep(0.25)
+    assert not protocol.commit_requested.is_set()
+    assert not preparing.done()
+    assert not protocol.manual
+    protocol.server(type="input_audio_buffer.speech_stopped", item_id="racing")
+    await _settle()
+    assert not preparing.done()
+    protocol.server(type="input_audio_buffer.committed", item_id="racing")
+    await preparing
+    assert not protocol.commit_requested.is_set()
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_provider_error_aborts_without_text_or_response(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    protocol.commit_error = True
+    with pytest.raises(APIConnectionError):
+        await sess.update_chat_ctx(_camera_text(sess))
+    assert "conversation.item.create" not in protocol.types()
+    assert "response.create" not in protocol.types()
+    assert not protocol.manual
+    assert not protocol.transport._video_paused
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_close_rejects_pending_ack_without_replay(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    protocol.auto_update = False
+    preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
+    await protocol.manual_requested.wait()
+    await sess.aclose()
+    with pytest.raises(APIConnectionError):
+        await preparing
+    assert not sess._camera_waiters
+    assert "input_audio_buffer.commit" not in protocol.types()
+    assert "conversation.item.create" not in protocol.types()
+    assert not protocol.transport._video_paused
+
+
+@pytest.mark.virtual_time
+async def test_cancelled_typed_camera_failed_restore_still_closes_transport(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    protocol.auto_commit = False
+    preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
+    await protocol.commit_requested.wait()
+    protocol.auto_update = False
+    preparing.cancel()
+    await _settle()
+    preparing.cancel()
+    await _settle()
+    assert not preparing.done()
+    with pytest.raises(asyncio.CancelledError):
+        await preparing
+    assert protocol.transport._closing
+    assert _aoq._engine_owner is None
+    assert not sess._camera_turn_manual
+    assert not protocol.transport._video_paused
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_generation_guards_do_not_send_on_replacement_or_close(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    old = protocol.transport
+    replacement = FakeTransport()
+    sess._camera_prepared_transport = old
+    sess._transport = replacement
+    with pytest.raises(llm.RealtimeError):
+        await sess.generate_reply()
+    await sess._send(
+        replacement,
+        _rt._ScopedEvent(old, {"type": "conversation.item.create", "item": {"type": "message"}}),
+    )
+    assert replacement.sent == []
+    sess._transport = old
+    old._video_dirty = True
+    sess._camera_prepared_transport = old
+    sess._closing = True
+    with pytest.raises(llm.RealtimeError):
+        await sess.generate_reply()
+    await sess._send(old, _rt._ScopedEvent(old, {"type": "response.create"}))
+    assert "response.create" not in protocol.types()
+    sess._closing = False
+
+
+@pytest.mark.virtual_time
+async def test_typed_camera_error_during_fresh_media_wait_does_not_commit(
+    camera_session: tuple[_rt.RealtimeSession, _CameraProtocol],
+) -> None:
+    sess, protocol = camera_session
+    preparing = asyncio.create_task(sess.update_chat_ctx(_camera_text(sess)))
+    await protocol.manual_requested.wait()
+    await _settle()
+    protocol.server(type="error", error={"message": "synthetic media preparation failure"})
+    with pytest.raises(APIConnectionError):
+        await preparing
+    assert not protocol.commit_requested.is_set()
+    assert "conversation.item.create" not in protocol.types()
+    assert not protocol.manual
+    assert not protocol.transport._video_paused
+
+
+async def test_aoq_greeting_and_text_without_camera_do_not_prepare_media() -> None:
+    model = qwen.RealtimeModel(
+        api_key=KEY,
+        transport="aoq",
+        workspace_id="ws",
+        aoq_options=qwen.AOQOptions(publish_video=True),
+    )
+    transport = FakeTransport()
+    sess = await _start(model, transport)
+    try:
+        transport.server(type="session.updated")
+        await _settle()
+        greeting = sess.generate_reply()
+        _response_events(transport)
+        await greeting
+        await _settle()
+        await sess.update_chat_ctx(_camera_text(sess))
+        reply = sess.generate_reply()
+        _response_events(transport)
+        await reply
+        await _settle()
+        assert transport.types() == [
+            "session.update",
+            "response.create",
+            "conversation.item.create",
+            "response.create",
+        ]
+    finally:
+        await sess.aclose()

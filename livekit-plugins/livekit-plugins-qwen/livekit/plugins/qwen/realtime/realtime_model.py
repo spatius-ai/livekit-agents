@@ -32,7 +32,7 @@ from urllib.parse import urlencode, urlsplit, urlunsplit
 import aiohttp
 
 from livekit import rtc
-from livekit.agents import APIError, llm, utils
+from livekit.agents import APIConnectionError, APIError, llm, utils
 from livekit.agents.llm.utils import compute_chat_ctx_diff
 from livekit.agents.metrics import RealtimeModelMetrics
 from livekit.agents.metrics.base import Metadata
@@ -358,7 +358,17 @@ class _Image:
     height: int
 
 
-_Outgoing = dict[str, Any] | _AudioChunk | _Image
+class _SessionUpdate(dict[str, Any]):
+    """An internal update whose turn detection follows an active camera transaction."""
+
+
+@dataclass
+class _ScopedEvent:
+    transport: Transport
+    event: dict[str, Any]
+
+
+_Outgoing = dict[str, Any] | _AudioChunk | _Image | _ScopedEvent
 
 
 def _encode_image(frame: rtc.VideoFrame) -> _Image | None:
@@ -416,8 +426,25 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._pending_video: rtc.VideoFrame | None = None
         self._video_available = asyncio.Event()
         self._video_ready = False
+        self._video_received = False
         self._video_generation = 0
         self._warned_no_video = False
+        self._camera_turn_lock = asyncio.Lock()
+        self._camera_turn_transport: AOQTransport | None = None
+        self._camera_turn_manual = False
+        self._camera_turn_failed = False
+        self._camera_prepared_transport: AOQTransport | None = None
+        self._camera_waiters: set[asyncio.Future[None]] = set()
+        self._session_update_acks: deque[tuple[Transport, asyncio.Future[None] | None, Any]] = (
+            deque()
+        )
+        self._input_commit_waiter: asyncio.Future[None] | None = None
+        self._input_commit_epoch = 0
+        self._speech_epoch = 0
+        self._committed_items: set[str] = set()
+        self._speech_pending_commit = False
+        self._input_committed = asyncio.Event()
+        self._input_committed.set()
 
         self._response_created_futures: dict[str, asyncio.Future[llm.GenerationCreatedEvent]] = {}
         self._pending_reply_instructions: deque[str | None] = deque()
@@ -479,14 +506,18 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         if tools:
             session["tools"] = tools
         session.update(opts.session_params)
+        if self._camera_turn_manual and self._transport is self._camera_turn_transport:
+            session["turn_detection"] = None
         return session
 
     def _session_update(self, *, instructions: str | None = None) -> dict[str, Any]:
-        return {
-            "event_id": utils.shortuuid("session_update_"),
-            "type": "session.update",
-            "session": self._session_config(instructions=instructions),
-        }
+        return _SessionUpdate(
+            {
+                "event_id": utils.shortuuid("session_update_"),
+                "type": "session.update",
+                "session": self._session_config(instructions=instructions),
+            }
+        )
 
     def _qwen_tools(self) -> list[dict[str, Any]]:
         return self._tools.parse_function_tools("openai", strict=False)
@@ -521,6 +552,16 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
     async def update_chat_ctx(self, chat_ctx: llm.ChatContext) -> None:
         diff = compute_chat_ctx_diff(self._chat_ctx, chat_ctx)
         skipped = 0
+        has_user_text = any(
+            item is not None
+            and item.type == "message"
+            and item.role == "user"
+            and bool(item.text_content)
+            and item_id not in self._server_item_ids
+            for _, item_id in diff.to_create
+            for item in [chat_ctx.get_by_id(item_id)]
+        )
+        prepared = await self._prepare_camera_text() if has_user_text else None
         for _, item_id in diff.to_create:
             item = chat_ctx.get_by_id(item_id)
             if item is None or item_id in self._server_item_ids:
@@ -537,16 +578,18 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     }
                 )
             elif item.type == "message" and item.role == "user" and item.text_content:
-                self.send_event(
-                    {
-                        "type": "conversation.item.create",
-                        "item": {
-                            "type": "message",
-                            "role": "user",
-                            "content": [{"type": "input_text", "text": item.text_content}],
-                        },
-                    }
-                )
+                event = {
+                    "type": "conversation.item.create",
+                    "item": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": item.text_content}],
+                    },
+                }
+                if prepared is not None:
+                    self._msg_ch.send_nowait(_ScopedEvent(prepared, event))
+                else:
+                    self.send_event(event)
             elif item.type == "message" and item.role in ("system", "developer"):
                 continue  # carried by the session instructions
             elif item.type in ("message", "function_call"):
@@ -562,6 +605,141 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 f"{len(diff.to_remove)} removed item(s) stay on the server"
             )
         self._chat_ctx = chat_ctx.copy()
+
+    def _camera_transport_current(self, transport: AOQTransport) -> bool:
+        return self._transport is transport and not self._closing and not transport._closing
+
+    async def _camera_wait(self, future: asyncio.Future[None]) -> None:
+        self._camera_waiters.add(future)
+        try:
+            await asyncio.wait_for(asyncio.shield(future), self._opts.conn_options.timeout)
+        except asyncio.TimeoutError:
+            raise APIConnectionError("AOQ camera input preparation timed out") from None
+        finally:
+            self._camera_waiters.discard(future)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
+
+    def _fail_camera_waiters(self) -> None:
+        if self._camera_turn_transport is not None:
+            self._camera_turn_failed = True
+        for future in self._camera_waiters:
+            if not future.done():
+                future.set_exception(APIConnectionError("AOQ camera input preparation interrupted"))
+        self._input_committed.set()
+
+    async def _camera_control(
+        self, transport: AOQTransport, event: dict[str, Any], *, update: bool = False
+    ) -> None:
+        if not self._camera_transport_current(transport):
+            raise APIConnectionError("AOQ camera transport changed during input preparation")
+        future = asyncio.get_running_loop().create_future()
+        self._camera_waiters.add(future)
+        if not update:
+            self._input_commit_waiter = future
+            self._input_commit_epoch = self._speech_epoch
+        try:
+            await self._send(transport, event, session_ack=future if update else None)
+            await self._camera_wait(future)
+            if not self._camera_transport_current(transport):
+                raise APIConnectionError("AOQ camera transport changed during input preparation")
+        finally:
+            self._camera_waiters.discard(future)
+            if not future.done():
+                future.cancel()
+            elif not future.cancelled():
+                future.exception()
+            if self._input_commit_waiter is future:
+                self._input_commit_waiter = None
+
+    async def _restore_camera_vad(self, transport: AOQTransport) -> None:
+        self._camera_turn_manual = False
+        await self._camera_control(transport, self._session_update(), update=True)
+
+    async def _restore_camera_or_close(self, transport: AOQTransport) -> None:
+        try:
+            await self._restore_camera_vad(transport)
+        except Exception:
+            await transport.aclose()
+            raise
+
+    async def _wait_spoken_turn(self, transport: AOQTransport) -> None:
+        try:
+            await asyncio.wait_for(self._input_committed.wait(), self._opts.conn_options.timeout)
+        except asyncio.TimeoutError:
+            raise APIConnectionError("AOQ speech turn did not commit before typed input") from None
+        if not self._camera_transport_current(transport) or self._speech_pending_commit:
+            raise APIConnectionError("AOQ speech turn was interrupted before committing")
+
+    async def _prepare_camera_text(self) -> AOQTransport | None:
+        if not (self._is_aoq and self._opts.aoq.publish_video):
+            return None
+        async with self._camera_turn_lock:
+            transport = self._transport
+            if not isinstance(transport, AOQTransport):
+                return None
+            if not transport._has_recent_video():
+                if not self._video_received or transport._last_video_accepted_at is not None:
+                    return None
+                try:
+                    await transport._wait_camera_input(self._opts.conn_options.timeout)
+                except asyncio.TimeoutError:
+                    raise APIConnectionError("AOQ first camera frame was not published") from None
+            if self._speech_pending_commit:
+                # Keep audio and video flowing until VAD commits the complete spoken turn.
+                await self._wait_spoken_turn(transport)
+                self._camera_prepared_transport = transport
+                return transport
+
+            baseline = self._session_config().get("turn_detection")
+            had_vad = baseline is not None
+            restored = not had_vad
+            self._camera_turn_transport = transport
+            self._camera_turn_failed = False
+            speech_epoch = self._speech_epoch
+            try:
+                if had_vad:
+                    self._camera_turn_manual = True
+                    await self._camera_control(transport, self._session_update(), update=True)
+                    if self._speech_epoch != speech_epoch:
+                        await self._restore_camera_vad(transport)
+                        restored = True
+                        await self._wait_spoken_turn(transport)
+                        self._camera_prepared_transport = transport
+                        return transport
+                    transport._begin_input_turn()
+                try:
+                    await transport._wait_camera_input(self._opts.conn_options.timeout)
+                except asyncio.TimeoutError:
+                    raise APIConnectionError("AOQ fresh camera input was not published") from None
+                if self._camera_turn_failed or not self._camera_transport_current(transport):
+                    raise APIConnectionError("AOQ camera input preparation interrupted")
+                if self._speech_epoch != speech_epoch:
+                    if had_vad:
+                        await self._restore_camera_vad(transport)
+                        restored = True
+                    await self._wait_spoken_turn(transport)
+                    self._camera_prepared_transport = transport
+                    return transport
+                transport._video_paused = True
+                await self._camera_control(transport, {"type": "input_audio_buffer.commit"})
+                if had_vad:
+                    await self._restore_camera_vad(transport)
+                    restored = True
+                self._camera_prepared_transport = transport
+                return transport
+            finally:
+                try:
+                    if had_vad and not restored and self._camera_transport_current(transport):
+                        # Restoration is owned cleanup: repeated caller cancellation cannot abandon it.
+                        task = asyncio.create_task(self._restore_camera_or_close(transport))
+                        await _join_task(task)
+                finally:
+                    transport._video_paused = False
+                    self._camera_turn_manual = False
+                    self._camera_turn_transport = None
 
     # ------------------------------------------------------------------ input
 
@@ -589,6 +767,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     )
                 return
             if self._video_ready:
+                self._video_received = True
                 self._pending_video = frame
                 self._video_available.set()
             return
@@ -605,6 +784,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
     def _reset_video_input(self) -> None:
         self._video_ready = False
+        self._video_received = False
         self._video_generation += 1
         self._pending_video = None
         self._video_available.clear()
@@ -691,6 +871,14 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         tool_choice: NotGivenOr[llm.ToolChoice] = NOT_GIVEN,
         tools: NotGivenOr[list[llm.Tool]] = NOT_GIVEN,
     ) -> asyncio.Future[llm.GenerationCreatedEvent]:
+        prepared = self._camera_prepared_transport
+        self._camera_prepared_transport = None
+        if prepared is not None and not self._camera_transport_current(prepared):
+            failed = asyncio.Future[llm.GenerationCreatedEvent]()
+            failed.set_exception(
+                llm.RealtimeError("AOQ camera transport changed before typed reply")
+            )
+            return failed
         if is_given(tools) or is_given(tool_choice):
             logger.debug("Qwen-Omni-Realtime does not support per-reply tools, ignoring them")
 
@@ -709,7 +897,10 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         create: dict[str, Any] = {"event_id": event_id, "type": "response.create"}
         if reply_instructions:
             create["response"] = {"instructions": reply_instructions}
-        self.send_event(create)
+        if prepared is not None:
+            self._msg_ch.send_nowait(_ScopedEvent(prepared, create))
+        else:
+            self.send_event(create)
 
         def _on_timeout() -> None:
             if not fut.done():
@@ -748,6 +939,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
     async def aclose(self) -> None:
         self._closing = True
+        self._fail_camera_waiters()
         self._reset_video_input()
         self._cancel_done_watchdog()
         self._close_current_generation()
@@ -817,6 +1009,9 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     self._emit_error(e, recoverable=False)
                     raise
                 finally:
+                    self._fail_camera_waiters()
+                    self._session_update_acks.clear()
+                    self._speech_pending_commit = False
                     self._reset_video_input()
                     await transport.aclose()
                     self._transport = None
@@ -845,12 +1040,52 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             )
         self.emit("session_reconnected", llm.RealtimeSessionReconnectedEvent())
 
-    async def _send(self, transport: Transport, msg: _Outgoing) -> None:
+    async def _send(
+        self,
+        transport: Transport,
+        msg: _Outgoing,
+        *,
+        session_ack: asyncio.Future[None] | None = None,
+    ) -> None:
+        if isinstance(msg, _ScopedEvent):
+            if (
+                msg.transport is not transport
+                or self._transport is not msg.transport
+                or self._closing
+                or getattr(transport, "_closing", False)
+            ):
+                event_id = msg.event.get("event_id")
+                future = self._response_created_futures.get(event_id or "")
+                if future is not None and not future.done():
+                    future.set_exception(llm.RealtimeError("AOQ typed reply transport changed"))
+                return
+            msg = msg.event
         if isinstance(msg, _AudioChunk):
             await transport.push_audio(msg.pcm)
         elif isinstance(msg, _Image):
             await transport.push_image(msg.jpeg, msg.width, msg.height)
         else:
+            if isinstance(msg, _SessionUpdate):
+                msg = {**msg, "session": {**msg["session"]}}
+                # Internal updates queued during the transaction must use its current mode,
+                # including updates to tools, instructions, and per-reply instructions.
+                baseline = self._opts.session_params.get(
+                    "turn_detection",
+                    self._opts.turn_detection.to_dict() if self._opts.turn_detection else None,
+                )
+                msg["session"]["turn_detection"] = (
+                    None
+                    if self._camera_turn_manual and transport is self._camera_turn_transport
+                    else baseline
+                )
+            if (
+                self._is_aoq
+                and self._opts.aoq.publish_video
+                and msg.get("type") == "session.update"
+            ):
+                self._session_update_acks.append(
+                    (transport, session_ack, (msg.get("session") or {}).get("turn_detection"))
+                )
             self.emit("qwen_client_event_queued", msg)
             await transport.send_event(msg)
 
@@ -906,6 +1141,20 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         event_type = event.get("type")
         try:
             if event_type == "session.updated":
+                if self._session_update_acks:
+                    transport, future, expected = self._session_update_acks.popleft()
+                    if future is not None and not future.done():
+                        actual = (event.get("session") or {}).get("turn_detection")
+                        if transport is not self._transport:
+                            future.set_exception(
+                                APIConnectionError("AOQ session update transport changed")
+                            )
+                        elif (expected is None) != (actual is None):
+                            future.set_exception(
+                                APIConnectionError("AOQ turn detection update was not acknowledged")
+                            )
+                        else:
+                            future.set_result(None)
                 if self._transport is not None:
                     self._transport.on_session_updated()
                     self._video_ready = self._is_aoq
@@ -913,6 +1162,24 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 self._handle_error(event)
             elif event_type == "input_audio_buffer.speech_started":
                 self._handle_speech_started(event)
+            elif event_type == "input_audio_buffer.committed":
+                item_id = event.get("item_id")
+                if item_id and item_id in self._committed_items:
+                    return
+                if item_id:
+                    self._committed_items.add(item_id)
+                self._speech_pending_commit = False
+                self._input_committed.set()
+                self._pushed_duration_s = 0
+                if isinstance(self._transport, AOQTransport):
+                    self._transport._begin_input_turn()
+                if self._input_commit_waiter is not None and not self._input_commit_waiter.done():
+                    if self._input_commit_epoch == self._speech_epoch:
+                        self._input_commit_waiter.set_result(None)
+                    else:
+                        self._input_commit_waiter.set_exception(
+                            APIConnectionError("AOQ speech changed during camera input preparation")
+                        )
             elif event_type == "input_audio_buffer.speech_stopped":
                 self.emit(
                     "input_speech_stopped",
@@ -953,6 +1220,8 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             )
 
     def _handle_error(self, event: dict[str, Any]) -> None:
+        if self._camera_turn_transport is not None:
+            self._fail_camera_waiters()
         error = event.get("error") or {}
         code = error.get("code")
         message = error.get("message") or "unknown error"
@@ -979,6 +1248,9 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 break
 
     def _handle_speech_started(self, event: dict[str, Any]) -> None:
+        self._speech_epoch += 1
+        self._speech_pending_commit = True
+        self._input_committed.clear()
         if item_id := event.get("item_id"):
             self._speech_started_at[item_id] = time.time()
         if self._opts.turn_detection is not None and self._is_aoq:
@@ -1273,8 +1545,10 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
     def _emit_metrics(self, generation: _ResponseGeneration, response: dict[str, Any]) -> None:
         usage = response.get("usage") or {}
-        input_details = usage.get("input_tokens_details") or {}
-        output_details = usage.get("output_tokens_details") or {}
+        input_details = usage.get("input_tokens_details") or usage.get("input_token_details") or {}
+        output_details = (
+            usage.get("output_tokens_details") or usage.get("output_token_details") or {}
+        )
         duration = time.time() - generation.created_at
         ttft = (
             generation.first_token_at - generation.created_at if generation.first_token_at else -1
@@ -1296,7 +1570,10 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 input_token_details=RealtimeModelMetrics.InputTokenDetails(
                     audio_tokens=input_details.get("audio_tokens", 0),
                     text_tokens=input_details.get("text_tokens", 0),
-                    image_tokens=input_details.get("image_tokens", 0),
+                    # LiveKit has one visual-input bucket; Qwen reports camera input separately.
+                    image_tokens=(
+                        input_details.get("image_tokens", 0) + input_details.get("video_tokens", 0)
+                    ),
                     cached_tokens=0,
                     cached_tokens_details=None,
                 ),
