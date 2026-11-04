@@ -67,6 +67,13 @@ qwen.RealtimeModel(
 )
 ```
 
+AOQ output uses the SDK's external `PLAYBACK` PCM observer. In Linux tests with SDK
+1.3.0.58585093 and 1.4.0.59457133, this delivered 10 ms audio frames at approximately 10 ms
+intervals, including external playback, 24/48 kHz callbacks, and read-only/read-write observer
+modes. Access to raw PCM therefore does not establish faster-than-playback delivery. WebSocket
+provided faster audio delivery in the same tests. See the
+[custom playback documentation](https://help.aliyun.com/zh/model-studio/aoq-custom-audio-playback).
+
 The SDK engine is a process-wide singleton, so a process can hold one AOQ session at a time. Agent
 jobs run in separate processes by default, so this only matters when several sessions share one.
 Set `AOQOptions(publish_video=True)` to send video frames on a video track; without it they are dropped,
