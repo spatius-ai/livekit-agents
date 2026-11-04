@@ -11,8 +11,6 @@ plugin separate from ``livekit-plugins-openai``:
   way to reply on an empty conversation, and in a temporary ``session.update``, since the
   session's instructions win when the two conflict;
 * images are sent with ``input_image_buffer.append`` at about one frame per second;
-* there is a second transport, AOQ, where audio and video travel on media tracks, video at
-  ``AOQOptions.video_fps`` (15 by default).
 """
 
 from __future__ import annotations
@@ -50,17 +48,13 @@ from ..models import (
     InputAudioTranscription,
     QwenOmniRealtimeModels,
     QwenRegion,
-    QwenTransport,
     TurnDetection,
 )
-from ._aoq import VIDEO_MAX_HEIGHT, VIDEO_MAX_WIDTH, AOQOptions, AOQTransport
 from ._transport import (
     INPUT_SAMPLE_RATE,
     NUM_CHANNELS,
     OUTPUT_SAMPLE_RATE,
-    OutputAudio,
     ServerEvent,
-    Transport,
     TransportClosed,
     WebSocketTransport,
     _join_task,
@@ -76,14 +70,13 @@ WORKSPACE_ID_ENV = "DASHSCOPE_WORKSPACE_ID"
 REGION_ENV = "DASHSCOPE_REGION"
 BASE_URL_ENV = "DASHSCOPE_BASE_URL"
 
-# endpoints that need no workspace id (WebSocket only)
+# endpoints that need no workspace id
 _SHARED_HOSTS: dict[str, str] = {
     "cn-beijing": "dashscope.aliyuncs.com",
     "ap-southeast-1": "dashscope-intl.aliyuncs.com",
 }
 
 _WS_PATH = "/api-ws/v1/realtime"
-_AOQ_CREDENTIALS_PATH = "/api/v1/webrtc/realtime"
 
 # codes that keep failing however often the connection is retried
 _FATAL_ERROR_CODES = frozenset(
@@ -100,18 +93,13 @@ _FATAL_ERROR_CODES = frozenset(
 
 _IMAGE_INTERVAL_S = 1.0
 _IMAGE_MAX_BYTES = 190 * 1024  # base64 must stay under 256 KB
-_IMAGE_MAX_SIZE = (VIDEO_MAX_WIDTH, VIDEO_MAX_HEIGHT)  # 720p, the recommended upper bound
+_IMAGE_MAX_SIZE = (1280, 720)  # 720p, the recommended upper bound
 _GENERATE_REPLY_TIMEOUT_S = 10.0
 # how long a typed message in manual mode may take to commit the camera frames
 _CAMERA_COMMIT_CHECK_S = 2.0
-# response.done can fail to arrive (seen after a cancel over AOQ); consumers must not hang on it.
-# Over AOQ it normally follows the audio, so the wait restarts with each audio frame.
+# Consumers must not hang if response.done fails to arrive after cancellation.
 _RESPONSE_DONE_TIMEOUT_S = 3.0
 _CANCEL_DONE_TIMEOUT_S = 1.0
-# AOQ audio arrives on a media track that lags the data track: a reply's audio keeps
-# flowing after response.done, and may start before its message is announced
-_AOQ_AUDIO_TAIL_S = 0.5
-_AOQ_AUDIO_EARLY_S = 1.0
 
 QwenEventTypes = Literal["qwen_server_event_received", "qwen_client_event_queued"]
 
@@ -125,22 +113,10 @@ def build_base_url(*, region: str, workspace_id: str | None) -> str:
     return f"https://{host}"
 
 
-def _endpoint(base_url: str, *, path: str, model: str, websocket: bool) -> str:
-    parts = urlsplit(base_url if "://" in base_url else f"https://{base_url}")
-    scheme = parts.scheme
-    if websocket:
-        scheme = {"https": "wss", "http": "ws"}.get(scheme, scheme)
-    else:
-        scheme = {"wss": "https", "ws": "http"}.get(scheme, scheme)
-    return urlunsplit((scheme, parts.netloc, path, urlencode({"model": model}), ""))
-
-
 def websocket_url(base_url: str, model: str) -> str:
-    return _endpoint(base_url, path=_WS_PATH, model=model, websocket=True)
-
-
-def aoq_credentials_url(base_url: str, model: str) -> str:
-    return _endpoint(base_url, path=_AOQ_CREDENTIALS_PATH, model=model, websocket=False)
+    parts = urlsplit(base_url if "://" in base_url else f"https://{base_url}")
+    scheme = {"https": "wss", "http": "ws"}.get(parts.scheme, parts.scheme)
+    return urlunsplit((scheme, parts.netloc, _WS_PATH, urlencode({"model": model}), ""))
 
 
 @dataclass
@@ -148,13 +124,11 @@ class _RealtimeOptions:
     model: str
     voice: str
     modalities: list[Literal["text", "audio"]]
-    transport: QwenTransport
     api_key: str
     base_url: str
     turn_detection: TurnDetection | None
     input_audio_transcription: InputAudioTranscription | None
     session_params: dict[str, Any]
-    aoq: AOQOptions
     conn_options: APIConnectOptions
 
 
@@ -165,7 +139,6 @@ class RealtimeModel(llm.RealtimeModel):
         model: QwenOmniRealtimeModels | str = DEFAULT_MODEL,
         voice: str = DEFAULT_VOICE,
         modalities: NotGivenOr[list[Literal["text", "audio"]]] = NOT_GIVEN,
-        transport: QwenTransport = "websocket",
         api_key: str | None = None,
         region: NotGivenOr[QwenRegion | str] = NOT_GIVEN,
         workspace_id: str | None = None,
@@ -181,7 +154,6 @@ class RealtimeModel(llm.RealtimeModel):
         seed: NotGivenOr[int] = NOT_GIVEN,
         enable_search: NotGivenOr[bool] = NOT_GIVEN,
         extra_session_params: dict[str, Any] | None = None,
-        aoq_options: AOQOptions | None = None,
         http_session: aiohttp.ClientSession | None = None,
         conn_options: APIConnectOptions = DEFAULT_API_CONNECT_OPTIONS,
     ) -> None:
@@ -191,8 +163,6 @@ class RealtimeModel(llm.RealtimeModel):
             model: Model name, e.g. ``"qwen3.8-omni-flash-realtime"``.
             voice: Output voice. Defaults to ``"Tina"``.
             modalities: ``["text", "audio"]`` (default) or ``["text"]``.
-            transport: ``"websocket"`` (default) or ``"aoq"``. AOQ needs Alibaba Cloud's
-                AOQ client SDK, see ``AOQOptions``, and a workspace endpoint.
             api_key: Model Studio API key. Defaults to ``DASHSCOPE_API_KEY``. Keys are
                 region-specific.
             region: ``"cn-beijing"`` (default) or ``"ap-southeast-1"``. Defaults to
@@ -216,7 +186,6 @@ class RealtimeModel(llm.RealtimeModel):
             seed: Sampling seed.
             enable_search: Let the model search the web. Cannot be combined with tools.
             extra_session_params: Further ``session.update`` fields, merged last.
-            aoq_options: Settings for the AOQ transport.
             http_session: aiohttp session to reuse.
             conn_options: Connection timeout and retry policy.
         """
@@ -225,20 +194,11 @@ class RealtimeModel(llm.RealtimeModel):
             raise ValueError(
                 f"a Model Studio API key is required: pass api_key or set {API_KEY_ENV}"
             )
-        if transport not in ("websocket", "aoq"):
-            raise ValueError(f"unknown transport {transport!r}")
-        if aoq_options is not None and aoq_options.video_fps <= 0:
-            raise ValueError("AOQOptions.video_fps must be positive")
 
         if not is_given(base_url):
             base_url = os.environ.get(BASE_URL_ENV) or NOT_GIVEN
         if not is_given(base_url):
             workspace_id = workspace_id or os.environ.get(WORKSPACE_ID_ENV) or None
-            if transport == "aoq" and not workspace_id:
-                raise ValueError(
-                    "the AOQ transport needs a workspace endpoint: pass workspace_id "
-                    f"(or set {WORKSPACE_ID_ENV}) or base_url"
-                )
             resolved_region = region if is_given(region) else None
             resolved_region = resolved_region or os.environ.get(REGION_ENV) or DEFAULT_REGION
             base_url = build_base_url(region=resolved_region, workspace_id=workspace_id)
@@ -287,13 +247,11 @@ class RealtimeModel(llm.RealtimeModel):
             model=model,
             voice=voice,
             modalities=list(modalities),
-            transport=transport,
             api_key=api_key,
             base_url=base_url,
             turn_detection=resolved_turn_detection,
             input_audio_transcription=resolved_transcription,
             session_params=session_params,
-            aoq=aoq_options or AOQOptions(),
             conn_options=conn_options,
         )
         self._http_session = http_session
@@ -366,12 +324,11 @@ class _SessionUpdate(dict[str, Any]):
 
 @dataclass
 class _ScopedEvent:
-    transport: Transport
+    transport: WebSocketTransport
     event: dict[str, Any]
 
 
-_Outgoing = dict[str, Any] | _AudioChunk | _Image | _ScopedEvent
-_CameraTransport = AOQTransport | WebSocketTransport
+_Outgoing = dict[str, Any] | _AudioChunk | _ScopedEvent
 
 
 def _encode_image(frame: rtc.VideoFrame) -> _Image | None:
@@ -402,7 +359,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             realtime_model.capabilities,
             turn_detection=self._opts.turn_detection is not None,
         )
-        self._is_aoq = self._opts.transport == "aoq"
 
         self._tools = llm.ToolContext.empty()
         self._chat_ctx = llm.ChatContext.empty()
@@ -412,34 +368,28 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
         self._msg_ch = utils.aio.Chan[_Outgoing]()
         self._input_resampler: rtc.AudioResampler | None = None
-        # over AOQ, frames above 10 ms make the server's VAD split speech and detect its end late
-        chunk_ms = 10 if self._is_aoq else 100
         self._bstream = utils.audio.AudioByteStream(
             INPUT_SAMPLE_RATE,
             NUM_CHANNELS,
-            samples_per_channel=INPUT_SAMPLE_RATE * chunk_ms // 1000,
+            samples_per_channel=INPUT_SAMPLE_RATE // 10,
         )
         self._pushed_duration_s = 0.0
-        self._video_enabled = not self._is_aoq or self._opts.aoq.publish_video
-        self._image_interval_s = (
-            1.0 / self._opts.aoq.video_fps if self._is_aoq else _IMAGE_INTERVAL_S
-        )
+        self._image_interval_s = _IMAGE_INTERVAL_S
         # Video uses one latest-frame slot, independently of audio/control messages.
         self._pending_video: rtc.VideoFrame | None = None
         self._video_available = asyncio.Event()
         self._video_ready = False
         self._video_received = False
         self._video_generation = 0
-        self._warned_no_video = False
         self._camera_turn_lock = asyncio.Lock()
-        self._camera_turn_transport: _CameraTransport | None = None
+        self._camera_turn_transport: WebSocketTransport | None = None
         self._camera_turn_manual = False
         self._camera_turn_failed = False
-        self._camera_prepared_transport: _CameraTransport | None = None
+        self._camera_prepared_transport: WebSocketTransport | None = None
         self._camera_waiters: set[asyncio.Future[None]] = set()
-        self._session_update_acks: deque[tuple[Transport, asyncio.Future[None] | None, Any]] = (
-            deque()
-        )
+        self._session_update_acks: deque[
+            tuple[WebSocketTransport, asyncio.Future[None] | None, Any]
+        ] = deque()
         self._input_commit_count = 0
         self._speech_epoch = 0
         self._committed_items: set[str] = set()
@@ -454,12 +404,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._input_transcripts: dict[str, str] = {}
         self._speech_started_at: dict[str, float] = {}
 
-        # AOQ: the message that plays the incoming audio, and audio that came before it
-        self._audio_target: _MessageGeneration | None = None
-        self._audio_tail_timer: asyncio.TimerHandle | None = None
-        self._early_audio: deque[tuple[float, rtc.AudioFrame]] = deque()
-
-        self._transport: Transport | None = None
+        self._transport: WebSocketTransport | None = None
         self._closing = False
         self._main_atask = asyncio.create_task(self._main_task(), name="qwen.RealtimeSession")
 
@@ -595,7 +540,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 skipped += 1
         # the camera path sends what it can itself and leaves the rest in `pending`
         pending = list(events)
-        prepared: _CameraTransport | None = None
+        prepared: WebSocketTransport | None = None
         if has_user_text:
             try:
                 prepared = await self._send_camera_text(pending)
@@ -622,7 +567,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             )
         self._chat_ctx = chat_ctx.copy()
 
-    def _camera_transport_current(self, transport: _CameraTransport) -> bool:
+    def _camera_transport_current(self, transport: WebSocketTransport) -> bool:
         return self._transport is transport and not self._closing and not transport._closing
 
     async def _camera_wait(self, future: asyncio.Future[None]) -> None:
@@ -648,7 +593,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 )
         self._input_committed.set()
 
-    async def _camera_update(self, transport: _CameraTransport) -> None:
+    async def _camera_update(self, transport: WebSocketTransport) -> None:
         """Send a session.update for the current camera mode and wait for its ack."""
         if not self._camera_transport_current(transport):
             raise APIConnectionError("Qwen camera transport changed during input preparation")
@@ -666,25 +611,24 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             elif not future.cancelled():
                 future.exception()
 
-    async def _restore_camera_vad(self, transport: _CameraTransport) -> None:
+    async def _restore_camera_vad(self, transport: WebSocketTransport) -> None:
         self._camera_turn_manual = False
         await self._camera_update(transport)
 
-    async def _restore_camera_or_close(self, transport: _CameraTransport) -> None:
+    async def _restore_camera_or_close(self, transport: WebSocketTransport) -> None:
         try:
             await self._restore_camera_vad(transport)
         except Exception:
             await transport.aclose()
             raise
 
-    def _check_camera_commit(self, transport: _CameraTransport, commits: int) -> None:
+    def _check_camera_commit(self, transport: WebSocketTransport, commits: int) -> None:
         if self._input_commit_count == commits and self._camera_transport_current(transport):
             logger.warning(
-                "%s did not commit camera input with the typed message",
-                "AOQ" if self._is_aoq else "WebSocket",
+                "Qwen did not commit camera input with the typed message",
             )
 
-    async def _wait_spoken_turn(self, transport: _CameraTransport) -> None:
+    async def _wait_spoken_turn(self, transport: WebSocketTransport) -> None:
         try:
             await asyncio.wait_for(self._input_committed.wait(), self._opts.conn_options.timeout)
         except asyncio.TimeoutError:
@@ -692,7 +636,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         if not self._camera_transport_current(transport) or self._speech_pending_commit:
             raise APIConnectionError("Qwen speech turn was interrupted before committing")
 
-    async def _send_camera_text(self, events: list[dict[str, Any]]) -> _CameraTransport | None:
+    async def _send_camera_text(self, events: list[dict[str, Any]]) -> WebSocketTransport | None:
         """Make typed input carry the camera, sending (and removing) what it can from ``events``.
 
         Server VAD keeps no silent audio, so a commit fails while it is on. In manual mode Qwen
@@ -701,11 +645,9 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         commit carries the camera instead and ``events`` are left to the caller. Returns the
         transport later events of this turn must go to, or None when there is no camera.
         """
-        if not self._video_enabled:
-            return None
         async with self._camera_turn_lock:
             transport = self._transport
-            if not isinstance(transport, (AOQTransport, WebSocketTransport)):
+            if not isinstance(transport, WebSocketTransport):
                 return None
             if not transport._has_recent_video():
                 if not self._video_received or transport._last_video_accepted_at is not None:
@@ -790,14 +732,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
     def push_video(self, frame: rtc.VideoFrame) -> None:
         if self._closing:
             return
-        if not self._video_enabled:
-            if not self._warned_no_video:
-                self._warned_no_video = True
-                logger.warning(
-                    "dropping video frames: the AOQ transport needs "
-                    "AOQOptions(publish_video=True) to send them"
-                )
-            return
         if self._video_ready:
             self._video_received = True
             self._pending_video = frame
@@ -816,7 +750,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         task = asyncio.create_task(asyncio.to_thread(_encode_image, frame))
         return await _join_task(task)
 
-    async def _video_task(self, transport: Transport) -> None:
+    async def _video_task(self, transport: WebSocketTransport) -> None:
         loop = asyncio.get_running_loop()
         next_send_at = 0.0
         while True:
@@ -945,7 +879,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         if self._current_generation is not None:
             self.send_event({"type": "response.cancel"})
             self._arm_done_watchdog(_CANCEL_DONE_TIMEOUT_S)
-        self._drop_output_audio()
 
     def truncate(
         self,
@@ -967,23 +900,14 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._reset_video_input()
         self._cancel_done_watchdog()
         self._close_current_generation()
-        self._close_audio_target()
         self._msg_ch.close()
         await _join_task(self._main_atask)
 
     # ------------------------------------------------------------------ connection
 
-    def _create_transport(self) -> Transport:
+    def _create_transport(self) -> WebSocketTransport:
         opts = self._opts
         http_session = self._realtime_model._ensure_http_session()
-        if opts.transport == "aoq":
-            return AOQTransport(
-                credentials_url=aoq_credentials_url(opts.base_url, opts.model),
-                api_key=opts.api_key,
-                http_session=http_session,
-                timeout=opts.conn_options.timeout,
-                options=opts.aoq,
-            )
         return WebSocketTransport(
             url=websocket_url(opts.base_url, opts.model),
             api_key=opts.api_key,
@@ -1042,7 +966,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         finally:
             self._cancel_done_watchdog()
             self._close_current_generation()
-            self._close_audio_target()
             for fut in self._response_created_futures.values():
                 if not fut.done():
                     fut.set_exception(llm.RealtimeError("realtime session closed"))
@@ -1055,7 +978,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._response_created_futures.clear()
         self._pending_reply_instructions.clear()
         self._close_current_generation()
-        self._close_audio_target()
         self._input_transcripts.clear()
         self._speech_started_at.clear()
         if self._chat_ctx.items:
@@ -1066,7 +988,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
 
     async def _send(
         self,
-        transport: Transport,
+        transport: WebSocketTransport,
         msg: _Outgoing,
         *,
         session_ack: asyncio.Future[None] | None = None,
@@ -1086,8 +1008,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             msg = msg.event
         if isinstance(msg, _AudioChunk):
             await transport.push_audio(msg.pcm)
-        elif isinstance(msg, _Image):
-            await transport.push_image(msg.jpeg, msg.width, msg.height)
         else:
             if isinstance(msg, _SessionUpdate):
                 msg = {**msg, "session": {**msg["session"]}}
@@ -1102,14 +1022,14 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     if self._camera_turn_manual and transport is self._camera_turn_transport
                     else baseline
                 )
-            if self._video_enabled and msg.get("type") == "session.update":
+            if msg.get("type") == "session.update":
                 self._session_update_acks.append(
                     (transport, session_ack, (msg.get("session") or {}).get("turn_detection"))
                 )
             self.emit("qwen_client_event_queued", msg)
             await transport.send_event(msg)
 
-    async def _run(self, transport: Transport) -> None:
+    async def _run(self, transport: WebSocketTransport) -> None:
         @utils.log_exceptions(logger=logger)
         async def _send_task() -> None:
             async for msg in self._msg_ch:
@@ -1119,8 +1039,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     raise
                 except Exception:
                     logger.exception("failed to send event to Qwen-Omni-Realtime")
-            if not self._video_enabled:
-                await transport.aclose()
 
         async def _recv_task() -> None:
             while True:
@@ -1131,24 +1049,18 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                     return
                 if self._closing:
                     continue
-                if isinstance(msg, OutputAudio):
-                    self._handle_output_audio(msg.frame)
-                elif isinstance(msg, ServerEvent):
+                if isinstance(msg, ServerEvent):
                     self._handle_event(msg.event)
 
-        io_tasks = [
+        tasks = [
             asyncio.create_task(_send_task(), name="qwen.send"),
             asyncio.create_task(_recv_task(), name="qwen.recv"),
+            asyncio.create_task(self._video_task(transport), name="qwen.video"),
         ]
-        tasks = list(io_tasks)
-        if self._video_enabled:
-            tasks.append(asyncio.create_task(self._video_task(transport), name="qwen.video"))
         try:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
                 task.result()
-            if not self._video_enabled:
-                await asyncio.gather(*io_tasks)
         finally:
             self._reset_video_input()
             cleanup = asyncio.create_task(utils.aio.cancel_and_wait(*tasks), name="qwen.cleanup")
@@ -1167,17 +1079,19 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                         actual = (event.get("session") or {}).get("turn_detection")
                         if transport is not self._transport:
                             future.set_exception(
-                                APIConnectionError("AOQ session update transport changed")
+                                APIConnectionError("Qwen session update transport changed")
                             )
                         elif (expected is None) != (actual is None):
                             future.set_exception(
-                                APIConnectionError("AOQ turn detection update was not acknowledged")
+                                APIConnectionError(
+                                    "Qwen turn detection update was not acknowledged"
+                                )
                             )
                         else:
                             future.set_result(None)
                 if self._transport is not None:
                     self._transport.on_session_updated()
-                    self._video_ready = self._video_enabled
+                    self._video_ready = True
             elif event_type == "error":
                 self._handle_error(event)
             elif event_type == "input_audio_buffer.speech_started":
@@ -1191,7 +1105,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 self._speech_pending_commit = False
                 self._input_committed.set()
                 self._pushed_duration_s = 0
-                if isinstance(self._transport, (AOQTransport, WebSocketTransport)):
+                if isinstance(self._transport, WebSocketTransport):
                     self._transport._begin_input_turn()
                 self._input_commit_count += 1
             elif event_type == "input_audio_buffer.speech_stopped":
@@ -1267,9 +1181,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         self._input_committed.clear()
         if item_id := event.get("item_id"):
             self._speech_started_at[item_id] = time.time()
-        if self._opts.turn_detection is not None and self._is_aoq:
-            # the server cancels its reply on barge-in; drop what the player still holds
-            self._drop_output_audio()
         self.emit("input_speech_started", llm.InputSpeechStartedEvent())
 
     def _handle_transcription_delta(self, event: dict[str, Any]) -> None:
@@ -1329,9 +1240,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         response_id = response.get("id") or utils.shortuuid("response_")
         self._cancel_done_watchdog()
         self._close_current_generation()
-        if self._is_aoq:
-            self._close_audio_target()
-
         generation = _ResponseGeneration(
             response_id=response_id,
             message_ch=utils.aio.Chan(),
@@ -1384,14 +1292,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
                 modalities=msg.modalities,
             )
         )
-        if self._is_aoq and self._capabilities.audio_output:
-            self._close_audio_target()
-            self._audio_target = msg
-            horizon = time.monotonic() - _AOQ_AUDIO_EARLY_S
-            while self._early_audio:
-                received_at, frame = self._early_audio.popleft()
-                if received_at >= horizon:
-                    self._push_output_audio(msg, frame)
         return msg
 
     def _handle_content_part_added(self, event: dict[str, Any]) -> None:
@@ -1413,30 +1313,9 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             msg.text_ch.send_nowait(delta)
 
     def _handle_audio_delta(self, event: dict[str, Any]) -> None:
-        transport = self._transport
-        if transport is not None and not transport.output_audio_in_events:
-            return  # AOQ plays audio from its media track
         if not (item_id := event.get("item_id")) or not (msg := self._message(item_id)):
             return
         self._push_output_audio(msg, pcm_frame(base64.b64decode(event.get("delta") or "")))
-
-    def _handle_output_audio(self, frame: rtc.AudioFrame) -> None:
-        if self._done_watchdog is not None and self._audio_target is not None:
-            self._arm_done_watchdog()
-        msg = self._audio_target
-        if msg is None or msg.audio_ch.closed:
-            self._early_audio.append((time.monotonic(), frame))
-            horizon = time.monotonic() - _AOQ_AUDIO_EARLY_S
-            while self._early_audio and self._early_audio[0][0] < horizon:
-                self._early_audio.popleft()
-            return
-        self._push_output_audio(msg, frame)
-        if self._audio_tail_timer is not None:
-            # the reply is done; keep the stream open while audio still flows
-            self._audio_tail_timer.cancel()
-            self._audio_tail_timer = asyncio.get_running_loop().call_later(
-                _AOQ_AUDIO_TAIL_S, self._close_audio_target
-            )
 
     def _push_output_audio(self, msg: _MessageGeneration, frame: rtc.AudioFrame) -> None:
         generation = self._current_generation
@@ -1482,8 +1361,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
         elif item.get("type") == "message" and (generation := self._current_generation):
             if msg := generation.messages.get(item.get("id") or ""):
                 msg.text_ch.close()
-                if msg is not self._audio_target:
-                    msg.audio_ch.close()
+                msg.audio_ch.close()
 
     def _handle_function_call(self, event: dict[str, Any]) -> None:
         generation = self._current_generation
@@ -1527,13 +1405,7 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
             if not msg.modalities.done():
                 msg.modalities.set_result(list(self._opts.modalities))
             msg.text_ch.close()
-            if msg is self._audio_target and not msg.audio_ch.closed:
-                # AOQ: close once the media track goes quiet
-                self._audio_tail_timer = asyncio.get_running_loop().call_later(
-                    _AOQ_AUDIO_TAIL_S, self._close_audio_target
-                )
-            else:
-                msg.audio_ch.close()
+            msg.audio_ch.close()
         generation.function_ch.close()
         generation.message_ch.close()
         if self._current_generation is generation:
@@ -1542,20 +1414,6 @@ class RealtimeSession(llm.RealtimeSession[QwenEventTypes]):
     def _close_current_generation(self) -> None:
         if self._current_generation is not None:
             self._finish_generation(self._current_generation)
-
-    def _close_audio_target(self) -> None:
-        if self._audio_tail_timer is not None:
-            self._audio_tail_timer.cancel()
-            self._audio_tail_timer = None
-        if self._audio_target is not None:
-            self._audio_target.audio_ch.close()
-            self._audio_target = None
-
-    def _drop_output_audio(self) -> None:
-        self._early_audio.clear()
-        self._close_audio_target()
-        if self._transport is not None:
-            self._transport.interrupt_output()
 
     def _emit_metrics(self, generation: _ResponseGeneration, response: dict[str, Any]) -> None:
         usage = response.get("usage") or {}
