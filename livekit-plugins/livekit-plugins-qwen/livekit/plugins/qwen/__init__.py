@@ -19,16 +19,19 @@ from .models import (
     InputAudioTranscription,
     QwenOmniRealtimeModels,
     QwenRegion,
+    QwenTransport,
     TurnDetection,
 )
-from .realtime import RealtimeModel
+from .realtime import AOQOptions, RealtimeModel
 from .version import __version__
 
 __all__ = [
     "realtime",
+    "AOQOptions",
     "InputAudioTranscription",
     "QwenOmniRealtimeModels",
     "QwenRegion",
+    "QwenTransport",
     "RealtimeModel",
     "TurnDetection",
     "__version__",

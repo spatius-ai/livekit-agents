@@ -1,4 +1,9 @@
-"""WebSocket connection, media ordering, and session event decoding."""
+"""Transports carrying a Qwen-Omni-Realtime session.
+
+Both transports speak the same JSON model events. They differ in how media moves:
+the WebSocket transport carries audio and images inside events, while AOQ sends
+them on media tracks and keeps the data track for the events alone.
+"""
 
 from __future__ import annotations
 
@@ -6,6 +11,7 @@ import asyncio
 import base64
 import json
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from typing import Any, TypeVar
 
@@ -46,15 +52,57 @@ class ServerEvent:
 
 
 @dataclass
+class OutputAudio:
+    """Model audio that arrived on a media track (AOQ only)."""
+
+    frame: rtc.AudioFrame
+
+
+@dataclass
 class TransportClosed:
     error: Exception | None = None
     """None when the close was requested by this side."""
 
 
-TransportMessage = ServerEvent | TransportClosed
+TransportMessage = ServerEvent | OutputAudio | TransportClosed
 
 
-class WebSocketTransport:
+class Transport(ABC):
+    """One connection to the model. A reconnection creates a new transport."""
+
+    output_audio_in_events: bool
+    """Whether model audio arrives as ``response.audio.delta`` events."""
+
+    @abstractmethod
+    async def connect(self) -> None:
+        """Open the connection; raises ``APIError`` on failure."""
+
+    @abstractmethod
+    async def send_event(self, event: dict[str, Any]) -> None: ...
+
+    @abstractmethod
+    async def push_audio(self, pcm: bytes) -> None:
+        """Send 16 kHz mono s16le PCM."""
+
+    @abstractmethod
+    async def push_image(self, jpeg: bytes, width: int, height: int) -> None: ...
+
+    @abstractmethod
+    async def recv(self) -> TransportMessage: ...
+
+    def on_session_updated(self) -> None:  # noqa: B027
+        """Called on each ``session.updated``; the model is ready for media."""
+
+    def interrupt_output(self) -> None:  # noqa: B027
+        """Drop model audio that is buffered but not delivered yet."""
+
+    @abstractmethod
+    async def aclose(self) -> None: ...
+
+
+class WebSocketTransport(Transport):
+    output_audio_in_events = True
+
     def __init__(
         self,
         *,

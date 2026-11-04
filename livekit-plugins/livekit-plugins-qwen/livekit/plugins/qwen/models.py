@@ -14,6 +14,14 @@ QwenOmniRealtimeModels = Literal[
 QwenRegion = Literal["cn-beijing", "ap-southeast-1"]
 """Model Studio region: ``cn-beijing`` (China mainland) or ``ap-southeast-1`` (Singapore)."""
 
+QwenTransport = Literal["websocket", "aoq"]
+"""How the session reaches the model.
+
+* ``websocket``: JSON events over the Realtime WebSocket API, audio as base64 PCM.
+* ``aoq``: the AOQ (MoQ) client SDK. Model events travel on its data track, audio and
+  video on media tracks.
+"""
+
 
 @dataclass
 class TurnDetection:
